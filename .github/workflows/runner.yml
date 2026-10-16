@@ -28,7 +28,8 @@ jobs:
       - name: Prepare Clean Environment
         run: |
           sudo apt-get update -qq
-          sudo DEBIAN_FRONTEND=noninteractive apt-get install -y -qq transmission-daemon transmission-cli rclone curl
+          sudo DEBIAN_FRONTEND=noninteractive apt-get install -y -qq transmission-daemon transmission-cli rclone curl python3-pip
+          pip3 install --quiet torrentool || true
           sudo systemctl stop transmission-daemon 2>/dev/null || true
           sudo pkill -9 -f transmission 2>/dev/null || true
 
@@ -39,7 +40,7 @@ jobs:
           if [ -n "$TG_BOT_TOKEN" ] && [ -n "$TG_CHAT_ID" ]; then
             curl -s -X POST "https://api.telegram.org/bot${TG_BOT_TOKEN}/sendMessage" \
               -d chat_id="${TG_CHAT_ID}" \
-              -d text="🚀 [Runner Started] Box: ${TARGET}. Fetching verified state..." > /dev/null || true
+              -d text="🚀 [Runner Started] Box: ${TARGET}. Syncing state files..." > /dev/null || true
           fi
 
       - name: Mount Cloud State Cache
@@ -70,6 +71,84 @@ jobs:
             rclone copy "${REMOTE}:qbit_config/$TARGET/torrents" /home/runner/.config/sync_worker/torrents/ -v || true
           fi
 
+      - name: Auto-Generate Sparse Files From Torrents (Dynamic & Zero-Byte)
+        run: |
+          python3 - << 'EOF'
+          import os, glob
+
+          target_dir = "/home/runner/storage_root"
+          torrent_dir = "/home/runner/.config/sync_worker/torrents"
+          os.makedirs(target_dir, exist_ok=True)
+
+          # Pure Python Bencode decoder taaki koi external library dependency na rahe
+          def bdecode(data):
+              def decode_item(idx):
+                  char = data[idx:idx+1]
+                  if char == b'i':
+                      idx += 1
+                      end = data.index(b'e', idx)
+                      return int(data[idx:end]), end + 1
+                  elif char == b'l':
+                      idx += 1
+                      res = []
+                      while data[idx:idx+1] != b'e':
+                          item, idx = decode_item(idx)
+                          res.append(item)
+                      return res, idx + 1
+                  elif char == b'd':
+                      idx += 1
+                      res = {}
+                      while data[idx:idx+1] != b'e':
+                          key, idx = decode_item(idx)
+                          val, idx = decode_item(idx)
+                          res[key.decode('utf-8', errors='ignore')] = val
+                      return res, idx + 1
+                  elif char.isdigit():
+                      colon = data.index(b':', idx)
+                      length = int(data[idx:colon])
+                      start = colon + 1
+                      return data[start:start+length], start + length
+                  else:
+                      raise ValueError(f"Invalid byte at index {idx}")
+              res, _ = decode_item(0)
+              return res
+
+          for tpath in glob.glob(os.path.join(torrent_dir, "*.torrent")):
+              try:
+                  with open(tpath, "rb") as f:
+                      content = f.read()
+                  meta = bdecode(content)
+                  info = meta.get('info', {})
+                  name = info.get('name')
+                  if isinstance(name, bytes):
+                      name = name.decode('utf-8', errors='ignore')
+
+                  if not name:
+                      continue
+
+                  if 'files' in info:
+                      base_folder = os.path.join(target_dir, name)
+                      os.makedirs(base_folder, exist_ok=True)
+                      for f_entry in info['files']:
+                          length = f_entry.get('length', 0)
+                          raw_paths = [p.decode('utf-8', errors='ignore') if isinstance(p, bytes) else str(p) for p in f_entry.get('path', [])]
+                          file_rel_path = os.path.join(*raw_paths)
+                          full_p = os.path.join(base_folder, file_rel_path)
+                          os.makedirs(os.path.dirname(full_p), exist_ok=True)
+                          with open(full_p, "wb") as ghost:
+                              ghost.truncate(length)
+                  else:
+                      length = info.get('length', 0)
+                      single_p = os.path.join(target_dir, name)
+                      os.makedirs(os.path.dirname(single_p), exist_ok=True)
+                      with open(single_p, "wb") as ghost:
+                          ghost.truncate(length)
+                  print(f"Created ghost layout for: {name}")
+              except Exception as e:
+                  print(f"Skipping {tpath} due to parsing: {e}")
+          EOF
+
+          # Settings with absolute zero peer connections
           cat << 'EOF' > /home/runner/.config/sync_worker/settings.json
           {
             "download-dir": "/home/runner/storage_root",
@@ -101,16 +180,16 @@ jobs:
           sleep 6
           TUNNEL_URL=$(grep -o 'https://[-a-zA-Z0-9.]*\.trycloudflare\.com' /home/runner/tunnel.log | head -n 1)
           echo "TUNNEL_URL=${TUNNEL_URL}" >> $GITHUB_ENV
-          echo "WebUI Link: ${TUNNEL_URL}/transmission/web/"
 
-      - name: Initialize & Start Torrents
+      - name: Initialize & Start Seeding
         run: |
           transmission-daemon -g /home/runner/.config/sync_worker -e /home/runner/sync.log
           sleep 4
 
-          # Torrents ko explicitly Start karna
+          # Saare torrents ka path explicitly sync karo aur start force karo
+          transmission-remote -t all --find /home/runner/storage_root || true
           transmission-remote -t all --start || true
-          sleep 2
+          sleep 3
 
           STATUS_OUTPUT=$(transmission-remote -l || echo "Failed to fetch status")
           echo "$STATUS_OUTPUT"
@@ -119,7 +198,7 @@ jobs:
           if [ -n "$TG_BOT_TOKEN" ] && [ -n "$TG_CHAT_ID" ]; then
             curl -s -X POST "https://api.telegram.org/bot${TG_BOT_TOKEN}/sendMessage" \
               -d chat_id="${TG_CHAT_ID}" \
-              -d text="✅ [Seeding Activated]%0A${WEB_MSG}%0A%0A<pre>${STATUS_OUTPUT}</pre>" \
+              -d text="✅ [Seeding Active - Error Resolved]%0A${WEB_MSG}%0A%0A<pre>${STATUS_OUTPUT}</pre>" \
               -d parse_mode="HTML" > /dev/null || true
           fi
 
@@ -128,6 +207,7 @@ jobs:
           echo "Announce service engaged. Keeping active for 4.5 hours..."
           for cycle in {1..27}; do
             echo "--- Ping cycle $cycle / 27 ---"
+            transmission-remote -t all --start || true
             transmission-remote -t all --reannounce || true
             transmission-remote -l || true
 
