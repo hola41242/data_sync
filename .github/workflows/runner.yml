@@ -6,7 +6,7 @@ on:
       target_box:
         description: 'Choose config box to restore'
         required: true
-        default: 'transmission_box4'
+        default: 'all'
         type: choice
         options:
           - 'all'
@@ -21,8 +21,8 @@ jobs:
     timeout-minutes: 300
 
     env:
-      TG_BOT_TOKEN: "8902164809:AAGtm0Hau0Whc_YhVL3khODTkcynOEjsgvg"
-      TG_CHAT_ID: "6519226948"
+      TG_BOT_TOKEN: ${{ secrets.TG_BOT_TOKEN }}
+      TG_CHAT_ID: ${{ secrets.TG_CHAT_ID }}
 
     steps:
       - name: Prepare Clean Environment
@@ -36,9 +36,11 @@ jobs:
         env:
           TARGET: ${{ inputs.target_box }}
         run: |
-          curl -s -X POST "https://api.telegram.org/bot${TG_BOT_TOKEN}/sendMessage" \
-            -d chat_id="${TG_CHAT_ID}" \
-            -d text="🧪 [Silent Test Started] Box: ${TARGET}. Fetching metadata..." > /dev/null || true
+          if [ -n "$TG_BOT_TOKEN" ] && [ -n "$TG_CHAT_ID" ]; then
+            curl -s -X POST "https://api.telegram.org/bot${TG_BOT_TOKEN}/sendMessage" \
+              -d chat_id="${TG_CHAT_ID}" \
+              -d text="🚀 [Runner Started] Box: ${TARGET}. Fetching metadata..." > /dev/null || true
+          fi
 
       - name: Mount Cloud State Cache
         env:
@@ -52,18 +54,23 @@ jobs:
 
           echo "$RCLONE_CONFIG_DATA" > ~/.config/rclone/rclone.conf
 
+          # Rclone remote name auto-detect karega
+          REMOTE_NAME=$(grep -o '^\[[^]]*\]' ~/.config/rclone/rclone.conf | head -n 1 | tr -d '[]')
+          echo "Using Rclone Remote: $REMOTE_NAME"
+
           if [ "$TARGET" = "all" ]; then
             echo "Pulling metadata from all boxes..."
-            rclone copy "gdrive:qbit_config" /home/runner/.config/sync_worker/ --include "*/resume/**" --include "*/torrents/**" -v
-            find /home/runner/.config/sync_worker/ -type f -path "*/resume/*" -exec mv -t /home/runner/.config/sync_worker/resume/ {} + 2>/dev/null || true
-            find /home/runner/.config/sync_worker/ -type f -path "*/torrents/*" -exec mv -t /home/runner/.config/sync_worker/torrents/ {} + 2>/dev/null || true
+            rclone copy "${REMOTE_NAME}:qbit_config" /home/runner/.config/sync_worker/temp_fetch/ --include "*/resume/**" --include "*/torrents/**" -v || true
+            find /home/runner/.config/sync_worker/temp_fetch/ -type f -path "*/resume/*" -exec mv -t /home/runner/.config/sync_worker/resume/ {} + 2>/dev/null || true
+            find /home/runner/.config/sync_worker/temp_fetch/ -type f -path "*/torrents/*" -exec mv -t /home/runner/.config/sync_worker/torrents/ {} + 2>/dev/null || true
+            rm -rf /home/runner/.config/sync_worker/temp_fetch
           else
             echo "Pulling metadata from $TARGET..."
-            rclone copy "gdrive:qbit_config/$TARGET/resume" /home/runner/.config/sync_worker/resume/ -v
-            rclone copy "gdrive:qbit_config/$TARGET/torrents" /home/runner/.config/sync_worker/torrents/ -v
+            rclone copy "${REMOTE_NAME}:qbit_config/$TARGET/resume" /home/runner/.config/sync_worker/resume/ -v || true
+            rclone copy "${REMOTE_NAME}:qbit_config/$TARGET/torrents" /home/runner/.config/sync_worker/torrents/ -v || true
           fi
 
-          # Ultra-strict zero peer policy
+          # Zero P2P connection configuration
           cat << 'EOF' > /home/runner/.config/sync_worker/settings.json
           {
             "download-dir": "/home/runner/storage_root",
@@ -94,36 +101,38 @@ jobs:
           STATUS_OUTPUT=$(transmission-remote -l || echo "No active torrents found")
           echo "$STATUS_OUTPUT"
 
-          curl -s -X POST "https://api.telegram.org/bot${TG_BOT_TOKEN}/sendMessage" \
-            -d chat_id="${TG_CHAT_ID}" \
-            -d text="✅ [Daemon Online] Restored List:%0A%0A<pre>${STATUS_OUTPUT}</pre>" \
-            -d parse_mode="HTML" > /dev/null || true
+          if [ -n "$TG_BOT_TOKEN" ] && [ -n "$TG_CHAT_ID" ]; then
+            curl -s -X POST "https://api.telegram.org/bot${TG_BOT_TOKEN}/sendMessage" \
+              -d chat_id="${TG_CHAT_ID}" \
+              -d text="✅ [Seeding Restored]%0A%0A<pre>${STATUS_OUTPUT}</pre>" \
+              -d parse_mode="HTML" > /dev/null || true
+          fi
 
       - name: Maintain Silent Announce Loop
         run: |
-          echo "Starting announce heartbeat loop..."
-          # 27 cycles x 600 seconds = 4.5 hours execution
+          echo "Announce service engaged. Keeping active for 4.5 hours..."
           for cycle in {1..27}; do
-            echo "=== Pulse cycle $cycle / 27 ==="
+            echo "--- Ping cycle $cycle / 27 ---"
             transmission-remote --reannounce || true
             transmission-remote -l || true
 
-            # Har 3 cycle (~30 mins) par verification Telegram ping
-            if [ $((cycle % 3)) -eq 0 ]; then
-              SUMMARY=$(transmission-remote -l | head -n 5)
+            if [ $((cycle % 3)) -eq 0 ] && [ -n "$TG_BOT_TOKEN" ] && [ -n "$TG_CHAT_ID" ]; then
+              SUMMARY=$(transmission-remote -l | head -n 8)
               curl -s -X POST "https://api.telegram.org/bot${TG_BOT_TOKEN}/sendMessage" \
                 -d chat_id="${TG_CHAT_ID}" \
-                -d text="📡 [Pulse Check - Loop ${cycle}] Tracker re-announced.%0A<pre>${SUMMARY}</pre>" \
+                -d text="📡 [Pulse Check - Cycle ${cycle}/27]%0A<pre>${SUMMARY}</pre>" \
                 -d parse_mode="HTML" > /dev/null || true
             fi
 
             sleep 600
           done
 
-          echo "Completing clean shutdown..."
+          echo "Graceful shutdown..."
           pkill -15 -f transmission 2>/dev/null || true
           sleep 3
 
-          curl -s -X POST "https://api.telegram.org/bot${TG_BOT_TOKEN}/sendMessage" \
-            -d chat_id="${TG_CHAT_ID}" \
-            -d text="🛑 [Test Finished] 4.5 Hours survived successfully without ban." > /dev/null || true
+          if [ -n "$TG_BOT_TOKEN" ] && [ -n "$TG_CHAT_ID" ]; then
+            curl -s -X POST "https://api.telegram.org/bot${TG_BOT_TOKEN}/sendMessage" \
+              -d chat_id="${TG_CHAT_ID}" \
+              -d text="🛑 [Runner Complete] 4.5h completed safely." > /dev/null || true
+          fi
