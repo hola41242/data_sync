@@ -16,13 +16,13 @@ on:
           - 'transmission_box4'
 
 jobs:
-  telemetry_sync:
+  shift_1:
     runs-on: ubuntu-latest
-    timeout-minutes: 360
-
+    timeout-minutes: 350
     env:
       TG_BOT_TOKEN: ${{ secrets.TG_BOT_TOKEN }}
       TG_CHAT_ID: ${{ secrets.TG_CHAT_ID }}
+      TARGET_BOX: ${{ inputs.target_box }}
 
     steps:
       - name: Prepare Clean Environment
@@ -34,19 +34,16 @@ jobs:
           sudo pkill -9 -f transmission 2>/dev/null || true
 
       - name: Send Telegram - Start Notification
-        env:
-          TARGET: ${{ inputs.target_box }}
         run: |
           if [ -n "$TG_BOT_TOKEN" ] && [ -n "$TG_CHAT_ID" ]; then
             curl -s -X POST "https://api.telegram.org/bot${TG_BOT_TOKEN}/sendMessage" \
               -d chat_id="${TG_CHAT_ID}" \
-              -d text="🚀 [Runner Started] Box: ${TARGET}. Environment initializing..." > /dev/null || true
+              -d text="🚀 [Shift 1 Started] Target: ${TARGET_BOX}. Seeding commencing for 5.5h..." > /dev/null || true
           fi
 
       - name: Mount Cloud State Cache
         env:
           RCLONE_CONFIG_DATA: ${{ secrets.RCLONE_CONFIG }}
-          TARGET: ${{ inputs.target_box }}
         run: |
           mkdir -p ~/.config/rclone
           mkdir -p /home/runner/.config/sync_worker/torrents
@@ -61,17 +58,17 @@ jobs:
           fi
           echo "Selected active Google Drive remote: ${REMOTE}"
 
-          if [ "$TARGET" = "all" ]; then
+          if [ "$TARGET_BOX" = "all" ]; then
             rclone copy "${REMOTE}:qbit_config" /home/runner/.config/sync_worker/temp_fetch/ --include "*/resume/**" --include "*/torrents/**" -v || true
             find /home/runner/.config/sync_worker/temp_fetch/ -type f -path "*/resume/*" -exec mv -t /home/runner/.config/sync_worker/resume/ {} + 2>/dev/null || true
             find /home/runner/.config/sync_worker/temp_fetch/ -type f -path "*/torrents/*" -exec mv -t /home/runner/.config/sync_worker/torrents/ {} + 2>/dev/null || true
             rm -rf /home/runner/.config/sync_worker/temp_fetch
           else
-            rclone copy "${REMOTE}:qbit_config/$TARGET/resume" /home/runner/.config/sync_worker/resume/ -v || true
-            rclone copy "${REMOTE}:qbit_config/$TARGET/torrents" /home/runner/.config/sync_worker/torrents/ -v || true
+            rclone copy "${REMOTE}:qbit_config/$TARGET_BOX/resume" /home/runner/.config/sync_worker/resume/ -v || true
+            rclone copy "${REMOTE}:qbit_config/$TARGET_BOX/torrents" /home/runner/.config/sync_worker/torrents/ -v || true
           fi
 
-      - name: Auto-Generate Sparse Files From Torrents (Dynamic & Zero-Byte)
+      - name: Auto-Generate Sparse Files From Torrents
         run: |
           python3 - << 'EOF'
           import os, glob
@@ -142,9 +139,8 @@ jobs:
                       os.makedirs(os.path.dirname(single_p), exist_ok=True)
                       with open(single_p, "wb") as ghost:
                           ghost.truncate(length)
-                  print(f"Created ghost layout for: {name}")
               except Exception as e:
-                  print(f"Skipping {tpath} due to parsing: {e}")
+                  pass
           EOF
 
           cat << 'EOF' > /home/runner/.config/sync_worker/settings.json
@@ -170,76 +166,228 @@ jobs:
           }
           EOF
 
-      - name: Setup Cloudflared Tunnel for WebUI
-        run: |
-          curl -L --output cloudflared.deb https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64.deb
-          sudo dpkg -i cloudflared.deb
-          nohup cloudflared tunnel --url http://127.0.0.1:9091 > /home/runner/tunnel.log 2>&1 &
-          
-          # Retry loop taaki slow DNS/Tunnel negotiation par bhi URL miss na ho
-          TUNNEL_URL=""
-          for i in {1..15}; do
-            sleep 2
-            TUNNEL_URL=$(grep -o 'https://[-a-zA-Z0-9.]*\.trycloudflare\.com' /home/runner/tunnel.log | head -n 1 || true)
-            if [ -n "$TUNNEL_URL" ]; then
-              echo "Tunnel ready: $TUNNEL_URL"
-              break
-            fi
-          done
-          echo "TUNNEL_URL=${TUNNEL_URL}" >> $GITHUB_ENV
-
       - name: Initialize & Start Seeding
         run: |
           transmission-daemon -g /home/runner/.config/sync_worker -e /home/runner/sync.log
           sleep 4
-
           transmission-remote -t all --find /home/runner/storage_root || true
           transmission-remote -t all --start || true
           sleep 3
 
-          STATUS_OUTPUT=$(transmission-remote -l || echo "Failed to fetch status")
-          echo "$STATUS_OUTPUT"
-
-          if [ -n "$TG_BOT_TOKEN" ] && [ -n "$TG_CHAT_ID" ]; then
-            if [ -n "$TUNNEL_URL" ]; then
-              WEB_MSG="🌐 <b>Live WebUI:</b> <a href=\"${TUNNEL_URL}/transmission/web/\">${TUNNEL_URL}/transmission/web/</a>"
-            else
-              WEB_MSG="⚠️ <b>Tunnel:</b> Initial handshake timed out (Seeding unaffected)"
-            fi
-            
-            curl -s -X POST "https://api.telegram.org/bot${TG_BOT_TOKEN}/sendMessage" \
-              -d chat_id="${TG_CHAT_ID}" \
-              -d text="✅ [Seeding Active - 5.5h Target]%0A${WEB_MSG}%0A%0A<pre>${STATUS_OUTPUT}</pre>" \
-              -d parse_mode="HTML" > /dev/null || true
-          fi
-
       - name: Maintain Silent Announce Loop (5.5 Hours)
         run: |
-          echo "Announce service engaged. Keeping active for 5.5 hours..."
-          # 33 cycles * 600s = 19,800s = 5.5 hours
           for cycle in {1..33}; do
-            echo "--- Ping cycle $cycle / 33 ---"
             transmission-remote -t all --start || true
             transmission-remote -t all --reannounce || true
-            transmission-remote -l || true
 
-            if [ $((cycle % 3)) -eq 0 ] && [ -n "$TG_BOT_TOKEN" ] && [ -n "$TG_CHAT_ID" ]; then
-              SUMMARY=$(transmission-remote -l | head -n 8)
+            if [ $((cycle % 6)) -eq 0 ] && [ -n "$TG_BOT_TOKEN" ] && [ -n "$TG_CHAT_ID" ]; then
+              SUMMARY=$(transmission-remote -l | head -n 6)
               curl -s -X POST "https://api.telegram.org/bot${TG_BOT_TOKEN}/sendMessage" \
                 -d chat_id="${TG_CHAT_ID}" \
-                -d text="📡 [Pulse Check - Cycle ${cycle}/33]%0A<pre>${SUMMARY}</pre>" \
+                -d text="📡 [Shift 1 Pulse - Cycle ${cycle}/33]%0A<pre>${SUMMARY}</pre>" \
                 -d parse_mode="HTML" > /dev/null || true
             fi
-
             sleep 600
           done
 
-          echo "Graceful shutdown..."
+      - name: Clean Graceful Stop (Anti-Duplicate Announce)
+        run: |
+          # Sabse pehle stop bhej kar tracker ko event=stopped notify karo
+          transmission-remote -t all --stop || true
+          sleep 5
           pkill -15 -f transmission 2>/dev/null || true
+          sleep 5
+          if [ -n "$TG_BOT_TOKEN" ] && [ -n "$TG_CHAT_ID" ]; then
+            curl -s -X POST "https://api.telegram.org/bot${TG_BOT_TOKEN}/sendMessage" \
+              -d chat_id="${TG_CHAT_ID}" \
+              -d text="⏸️ [Shift 1 Finished] Stopped cleanly. Handoff to Shift 2 in 60s..." > /dev/null || true
+          fi
+
+  shift_2:
+    needs: shift_1
+    if: always()
+    runs-on: ubuntu-latest
+    timeout-minutes: 350
+    env:
+      TG_BOT_TOKEN: ${{ secrets.TG_BOT_TOKEN }}
+      TG_CHAT_ID: ${{ secrets.TG_CHAT_ID }}
+      TARGET_BOX: ${{ inputs.target_box }}
+
+    steps:
+      - name: Safety Buffer (Avoid Fast Double Announce)
+        run: |
+          # Tracker status update hone ke liye 60 sec wait
+          sleep 60
+
+      - name: Prepare Clean Environment
+        run: |
+          sudo apt-get update -qq
+          sudo DEBIAN_FRONTEND=noninteractive apt-get install -y -qq transmission-daemon transmission-cli rclone curl python3-pip
+          pip3 install --quiet torrentool || true
+          sudo systemctl stop transmission-daemon 2>/dev/null || true
+          sudo pkill -9 -f transmission 2>/dev/null || true
+
+      - name: Mount Cloud State Cache
+        env:
+          RCLONE_CONFIG_DATA: ${{ secrets.RCLONE_CONFIG }}
+        run: |
+          mkdir -p ~/.config/rclone
+          mkdir -p /home/runner/.config/sync_worker/torrents
+          mkdir -p /home/runner/.config/sync_worker/resume
+          mkdir -p /home/runner/storage_root
+
+          echo "$RCLONE_CONFIG_DATA" > ~/.config/rclone/rclone.conf
+
+          REMOTE="gdrive"
+          if ! rclone lsd "${REMOTE}:" > /dev/null 2>&1; then
+            REMOTE="maindrive"
+          fi
+
+          if [ "$TARGET_BOX" = "all" ]; then
+            rclone copy "${REMOTE}:qbit_config" /home/runner/.config/sync_worker/temp_fetch/ --include "*/resume/**" --include "*/torrents/**" -v || true
+            find /home/runner/.config/sync_worker/temp_fetch/ -type f -path "*/resume/*" -exec mv -t /home/runner/.config/sync_worker/resume/ {} + 2>/dev/null || true
+            find /home/runner/.config/sync_worker/temp_fetch/ -type f -path "*/torrents/*" -exec mv -t /home/runner/.config/sync_worker/torrents/ {} + 2>/dev/null || true
+            rm -rf /home/runner/.config/sync_worker/temp_fetch
+          else
+            rclone copy "${REMOTE}:qbit_config/$TARGET_BOX/resume" /home/runner/.config/sync_worker/resume/ -v || true
+            rclone copy "${REMOTE}:qbit_config/$TARGET_BOX/torrents" /home/runner/.config/sync_worker/torrents/ -v || true
+          fi
+
+      - name: Auto-Generate Sparse Files From Torrents
+        run: |
+          python3 - << 'EOF'
+          import os, glob
+
+          target_dir = "/home/runner/storage_root"
+          torrent_dir = "/home/runner/.config/sync_worker/torrents"
+          os.makedirs(target_dir, exist_ok=True)
+
+          def bdecode(data):
+              def decode_item(idx):
+                  char = data[idx:idx+1]
+                  if char == b'i':
+                      idx += 1
+                      end = data.index(b'e', idx)
+                      return int(data[idx:end]), end + 1
+                  elif char == b'l':
+                      idx += 1
+                      res = []
+                      while data[idx:idx+1] != b'e':
+                          item, idx = decode_item(idx)
+                          res.append(item)
+                      return res, idx + 1
+                  elif char == b'd':
+                      idx += 1
+                      res = {}
+                      while data[idx:idx+1] != b'e':
+                          key, idx = decode_item(idx)
+                          val, idx = decode_item(idx)
+                          res[key.decode('utf-8', errors='ignore')] = val
+                      return res, idx + 1
+                  elif char.isdigit():
+                      colon = data.index(b':', idx)
+                      length = int(data[idx:colon])
+                      start = colon + 1
+                      return data[start:start+length], start + length
+                  else:
+                      raise ValueError(f"Invalid byte at index {idx}")
+              res, _ = decode_item(0)
+              return res
+
+          for tpath in glob.glob(os.path.join(torrent_dir, "*.torrent")):
+              try:
+                  with open(tpath, "rb") as f:
+                      content = f.read()
+                  meta = bdecode(content)
+                  info = meta.get('info', {})
+                  name = info.get('name')
+                  if isinstance(name, bytes):
+                      name = name.decode('utf-8', errors='ignore')
+
+                  if not name:
+                      continue
+
+                  if 'files' in info:
+                      base_folder = os.path.join(target_dir, name)
+                      os.makedirs(base_folder, exist_ok=True)
+                      for f_entry in info['files']:
+                          length = f_entry.get('length', 0)
+                          raw_paths = [p.decode('utf-8', errors='ignore') if isinstance(p, bytes) else str(p) for p in f_entry.get('path', [])]
+                          file_rel_path = os.path.join(*raw_paths)
+                          full_p = os.path.join(base_folder, file_rel_path)
+                          os.makedirs(os.path.dirname(full_p), exist_ok=True)
+                          with open(full_p, "wb") as ghost:
+                              ghost.truncate(length)
+                  else:
+                      length = info.get('length', 0)
+                      single_p = os.path.join(target_dir, name)
+                      os.makedirs(os.path.dirname(single_p), exist_ok=True)
+                      with open(single_p, "wb") as ghost:
+                          ghost.truncate(length)
+              except Exception as e:
+                  pass
+          EOF
+
+          cat << 'EOF' > /home/runner/.config/sync_worker/settings.json
+          {
+            "download-dir": "/home/runner/storage_root",
+            "incomplete-dir-enabled": false,
+            "rpc-enabled": true,
+            "rpc-port": 9091,
+            "rpc-bind-address": "0.0.0.0",
+            "rpc-authentication-required": false,
+            "rpc-whitelist-enabled": false,
+            "rpc-host-whitelist-enabled": false,
+            "peer-limit-global": 0,
+            "peer-limit-per-torrent": 0,
+            "port-forwarding-enabled": false,
+            "dht-enabled": false,
+            "pex-enabled": false,
+            "lpd-enabled": false,
+            "speed-limit-up": 1,
+            "speed-limit-up-enabled": true,
+            "speed-limit-down": 1,
+            "speed-limit-down-enabled": true
+          }
+          EOF
+
+      - name: Initialize & Start Shift 2
+        run: |
+          transmission-daemon -g /home/runner/.config/sync_worker -e /home/runner/sync.log
+          sleep 4
+          transmission-remote -t all --find /home/runner/storage_root || true
+          transmission-remote -t all --start || true
           sleep 3
 
           if [ -n "$TG_BOT_TOKEN" ] && [ -n "$TG_CHAT_ID" ]; then
             curl -s -X POST "https://api.telegram.org/bot${TG_BOT_TOKEN}/sendMessage" \
               -d chat_id="${TG_CHAT_ID}" \
-              -d text="🛑 [Runner Complete] 5.5h completed safely." > /dev/null || true
+              -d text="🟢 [Shift 2 Active] Auto-swapped to new VM. Seeding next 5.5 hours..." > /dev/null || true
+          fi
+
+      - name: Maintain Silent Announce Loop (5.5 Hours)
+        run: |
+          for cycle in {1..33}; do
+            transmission-remote -t all --start || true
+            transmission-remote -t all --reannounce || true
+
+            if [ $((cycle % 6)) -eq 0 ] && [ -n "$TG_BOT_TOKEN" ] && [ -n "$TG_CHAT_ID" ]; then
+              SUMMARY=$(transmission-remote -l | head -n 6)
+              curl -s -X POST "https://api.telegram.org/bot${TG_BOT_TOKEN}/sendMessage" \
+                -d chat_id="${TG_CHAT_ID}" \
+                -d text="📡 [Shift 2 Pulse - Cycle ${cycle}/33]%0A<pre>${SUMMARY}</pre>" \
+                -d parse_mode="HTML" > /dev/null || true
+            fi
+            sleep 600
+          done
+
+      - name: Final Shutdown
+        run: |
+          transmission-remote -t all --stop || true
+          sleep 5
+          pkill -15 -f transmission 2>/dev/null || true
+          if [ -n "$TG_BOT_TOKEN" ] && [ -n "$TG_CHAT_ID" ]; then
+            curl -s -X POST "https://api.telegram.org/bot${TG_BOT_TOKEN}/sendMessage" \
+              -d chat_id="${TG_CHAT_ID}" \
+              -d text="🏁 [Full 11h Run Finished] All shifts completed safely." > /dev/null || true
           fi
