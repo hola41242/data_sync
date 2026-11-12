@@ -22,24 +22,24 @@ jobs:
           mkdir -p ~/.config/rclone
           echo "${{ secrets.RCLONE_CONFIG_BASE64 }}" | base64 -d > ~/.config/rclone/rclone.conf
 
-      - name: Pull Game & Existing Saves from Drive
+      - name: Pull Game from Drive
         run: |
           mkdir -p full_game engine_shell
           rclone copy "gdrive:Games/${{ github.event.inputs.game_folder }}" full_game/ --transfers 16 -P
 
-      - name: Unpack .rpa Archives (100% Byte-for-Byte Lossless)
+      - name: Unpack .rpa Archives (100% Lossless)
         run: |
           find full_game -name "*.rpa" | while read rpa; do
             dir=$(dirname "$rpa")
             unrpa -mp "$dir" "$rpa" && rm -f "$rpa"
           done
 
-      - name: Create Exact Engine Shell (Code + Saves Folder Only)
+      - name: Create Lightweight Engine Shell (~100MB Code Only)
         run: |
           rsync -av --exclude='game/images' --exclude='game/videos' --exclude='game/video' --exclude='game/audio' --exclude='game/music' --exclude='game/sfx' --exclude='game/voice' full_game/ engine_shell/
           mkdir -p engine_shell/game/saves
 
-      - name: Push Clean Architecture & Saves Back to Drive
+      - name: Push Clean Architecture to Drive
         run: |
           rclone sync full_game/ "gdrive:Games_Unpacked/${{ github.event.inputs.game_folder }}" --transfers 16 --checkers 32 --drive-chunk-size 64M -P
           rclone sync engine_shell/ "gdrive:Games_Shell/${{ github.event.inputs.game_folder }}" --transfers 16 -P
