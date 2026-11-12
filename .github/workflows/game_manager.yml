@@ -1,67 +1,327 @@
-name: Game Manager (Archive Extract + Unpack + Split + Save Structure)
+
+name: Game Manager - Extract, Unpack, Split & Verify
 
 on:
   workflow_dispatch:
     inputs:
       archive_name:
-        description: 'Exact archive filename in gdrive:Games (e.g. CampusBonds-0.5-market.zip)'
+        description: "Exact ZIP filename inside gdrive:Games"
         required: true
-        default: 'CampusBonds-0.5-market.zip'
+        default: "CampusBonds-0.5-market.zip"
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: game-manager-${{ inputs.archive_name }}
+  cancel-in-progress: false
 
 jobs:
   build-game-architecture:
     runs-on: ubuntu-latest
+    timeout-minutes: 360
+
+    env:
+      ARCHIVE_NAME: ${{ inputs.archive_name }}
+
     steps:
       - name: Install Tools
         run: |
+          set -euo pipefail
           sudo apt-get update
-          sudo apt-get install -y p7zip-full unrar rsync
-          curl https://rclone.org/install.sh | sudo bash
-          pip install unrpa
+          sudo apt-get install -y 7zip rsync
+          python -m pip install unrpa
+          curl -fsSL https://rclone.org/install.sh | sudo bash
 
-      - name: Configure Rclone
+      - name: Validate Input & Configure Rclone
         run: |
-          mkdir -p ~/.config/rclone
-          echo "${{ secrets.RCLONE_CONFIG_BASE64 }}" | base64 -d > ~/.config/rclone/rclone.conf
+          set -euo pipefail
 
-      - name: Pull Single Archive from Drive (Fast 1-File Pull)
-        run: |
-          mkdir -p raw_extract full_game engine_shell
-          rclone copyto "gdrive:Games/${{ github.event.inputs.archive_name }}" "./${{ github.event.inputs.archive_name }}" --drive-chunk-size 128M -P
-      - name: Extract Archive on GitHub SSD & Normalize Folder Structure
-        run: |
-          ARCHIVE="${{ github.event.inputs.archive_name }}"
-          7z x "$ARCHIVE" -oraw_extract -y || unrar x -y "$ARCHIVE" raw_extract/
-          rm -f "$ARCHIVE"
-
-          # Agar extract ke andar ek single subfolder bana hai toh uske contents ko full_game/ root pe laao
-          SUBDIRS=$(find raw_extract -mindepth 1 -maxdepth 1 -type d | wc -l)
-          FILES=$(find raw_extract -mindepth 1 -maxdepth 1 -type f | wc -l)
-          if [ "$SUBDIRS" -eq 1 ] && [ "$FILES" -eq 0 ]; then
-            INNER_DIR=$(find raw_extract -mindepth 1 -maxdepth 1 -type d)
-            mv "$INNER_DIR"/* full_game/
-          else
-            mv raw_extract/* full_game/
+          if [[ -z "$ARCHIVE_NAME" ||
+                "$ARCHIVE_NAME" != "$(basename "$ARCHIVE_NAME")" ||
+                "$ARCHIVE_NAME" == "." ||
+                "$ARCHIVE_NAME" == ".." ]]; then
+            echo "::error::Invalid archive filename"
+            exit 1
           fi
 
-      - name: Unpack .rpa Archives (100% Byte-for-Byte Lossless)
-        run: |
-          find full_game -name "*.rpa" | while read rpa; do
-            dir=$(dirname "$rpa")
-            unrpa -mp "$dir" "$rpa" && rm -f "$rpa"
-          done
+          case "${ARCHIVE_NAME,,}" in
+            *.zip|*.7z|*.rar) ;;
+            *)
+              echo "::error::Only ZIP, 7Z and RAR archives are supported"
+              exit 1
+              ;;
+          esac
 
-      - name: Create Lightweight Engine Shell (~100MB Code Only)
-        run: |
-          rsync -av --exclude='game/images' --exclude='game/videos' --exclude='game/video' --exclude='game/audio' --exclude='game/music' --exclude='game/sfx' --exclude='game/voice' full_game/ engine_shell/
-          mkdir -p engine_shell/game/saves
+          mkdir -p "$HOME/.config/rclone"
+          printf '%s' '${{ secrets.RCLONE_CONFIG_BASE64 }}' \
+            | base64 -d > "$HOME/.config/rclone/rclone.conf"
 
-      - name: Push Clean Architecture & Saves to Drive
-        run: |
-          GAME_FOLDER="${{ github.event.inputs.archive_name }}"
-          GAME_FOLDER="${GAME_FOLDER%.*}"
-          echo "Target Game Folder: $GAME_FOLDER"
+          chmod 600 "$HOME/.config/rclone/rclone.conf"
+          rclone listremotes | grep -qx 'gdrive:'
 
-          rclone sync full_game/ "gdrive:Games_Unpacked/$GAME_FOLDER" --transfers 32 --checkers 32 --drive-chunk-size 64M --tpslimit 10 -P
-          rclone sync engine_shell/ "gdrive:Games_Shell/$GAME_FOLDER" --transfers 32 --tpslimit 10 -P
-          rclone copy engine_shell/game/saves/ "gdrive:Games/$GAME_FOLDER/saves/" --create-empty-src-dirs
+      - name: Prepare Workspace
+        run: |
+          set -euo pipefail
+
+          mkdir -p \
+            "$RUNNER_TEMP/raw_extract" \
+            "$RUNNER_TEMP/full_game" \
+            "$RUNNER_TEMP/engine_shell" \
+            "$RUNNER_TEMP/metadata"
+
+          echo "Workspace ready"
+          df -h "$RUNNER_TEMP"
+
+      - name: Download Original Archive
+        run: |
+          set -euo pipefail
+
+          ARCHIVE_PATH="$RUNNER_TEMP/$ARCHIVE_NAME"
+
+          rclone copyto \
+            "gdrive:Games/$ARCHIVE_NAME" \
+            "$ARCHIVE_PATH" \
+            --drive-chunk-size 128M \
+            --stats 30s \
+            --stats-one-line
+
+          test -s "$ARCHIVE_PATH"
+
+          sha256sum "$ARCHIVE_PATH" \
+            > "$RUNNER_TEMP/metadata/source-archive.sha256"
+
+      - name: Test Archive Integrity
+        run: |
+          set -euo pipefail
+
+          7z t "$RUNNER_TEMP/$ARCHIVE_NAME" -y
+
+      - name: Extract Archive
+        run: |
+          set -euo pipefail
+
+          RAW_DIR="$RUNNER_TEMP/raw_extract"
+          FULL_DIR="$RUNNER_TEMP/full_game"
+
+          7z x "$RUNNER_TEMP/$ARCHIVE_NAME" \
+            "-o$RAW_DIR" -y
+
+          shopt -s dotglob nullglob
+
+          entries=("$RAW_DIR"/*)
+
+          if [[ ${#entries[@]} -eq 1 && -d "${entries[0]}" ]]; then
+            inner_entries=("${entries[0]}"/*)
+
+            if [[ ${#inner_entries[@]} -gt 0 ]]; then
+              mv "${inner_entries[@]}" "$FULL_DIR/"
+            fi
+          else
+            if [[ ${#entries[@]} -gt 0 ]]; then
+              mv "${entries[@]}" "$FULL_DIR/"
+            fi
+          fi
+
+          if [[ -z "$(find "$FULL_DIR" -mindepth 1 -print -quit)" ]]; then
+            echo "::error::Extraction produced an empty game directory"
+            exit 1
+          fi
+
+      - name: Unpack All RenPy RPA Archives
+        run: |
+          set -euo pipefail
+
+          FULL_DIR="$RUNNER_TEMP/full_game"
+          COUNT=0
+
+          while IFS= read -r -d '' RPA_FILE; do
+            DIR="$(dirname "$RPA_FILE")"
+
+            echo "Unpacking: $RPA_FILE"
+
+            if ! unrpa -mp "$DIR" "$RPA_FILE"; then
+              echo "::error::RPA extraction failed: $RPA_FILE"
+              exit 1
+            fi
+
+            rm -- "$RPA_FILE"
+            COUNT=$((COUNT + 1))
+
+          done < <(find "$FULL_DIR" -type f -iname '*.rpa' -print0)
+
+          echo "Successfully unpacked $COUNT RPA archives"
+
+          REMAINING=$(find "$FULL_DIR" -type f -iname '*.rpa' | wc -l)
+
+          if [[ "$REMAINING" -ne 0 ]]; then
+            echo "::error::RPA archives remain after processing"
+            exit 1
+          fi
+
+      - name: Create Lightweight Engine Shell
+        run: |
+          set -euo pipefail
+
+          FULL_DIR="$RUNNER_TEMP/full_game"
+          SHELL_DIR="$RUNNER_TEMP/engine_shell"
+
+          rsync -a \
+            --exclude='/game/images/***' \
+            --exclude='/game/videos/***' \
+            --exclude='/game/video/***' \
+            --exclude='/game/audio/***' \
+            --exclude='/game/music/***' \
+            --exclude='/game/sfx/***' \
+            --exclude='/game/voice/***' \
+            "$FULL_DIR/" "$SHELL_DIR/"
+
+          mkdir -p \
+            "$FULL_DIR/game/saves" \
+            "$SHELL_DIR/game/saves"
+
+          echo "Full game: $(du -sh "$FULL_DIR" | cut -f1)"
+          echo "Engine shell: $(du -sh "$SHELL_DIR" | cut -f1)"
+
+      - name: Generate SHA256 Manifests
+        run: |
+          set -euo pipefail
+
+          FULL_DIR="$RUNNER_TEMP/full_game"
+          SHELL_DIR="$RUNNER_TEMP/engine_shell"
+          META_DIR="$RUNNER_TEMP/metadata"
+
+          (
+            cd "$FULL_DIR"
+            find . -type f -print0 \
+              | sort -z \
+              | xargs -0 -r sha256sum
+          ) > "$META_DIR/full_game.sha256"
+
+          (
+            cd "$SHELL_DIR"
+            find . -type f -print0 \
+              | sort -z \
+              | xargs -0 -r sha256sum
+          ) > "$META_DIR/engine_shell.sha256"
+
+          echo "Full game files: $(wc -l < "$META_DIR/full_game.sha256")"
+          echo "Shell files: $(wc -l < "$META_DIR/engine_shell.sha256")"
+
+      - name: Prepare Game Metadata
+        id: metadata
+        run: |
+          set -euo pipefail
+
+          GAME_ID="${ARCHIVE_NAME%.*}"
+
+          if [[ -z "$GAME_ID" ]]; then
+            echo "::error::Invalid game ID"
+            exit 1
+          fi
+
+          echo "game_id=$GAME_ID" >> "$GITHUB_OUTPUT"
+
+          cat > "$RUNNER_TEMP/metadata/game-info.txt" <<EOF
+          Game ID: $GAME_ID
+          Source archive: $ARCHIVE_NAME
+          RPA processing: Completed
+          Media transcoding: None
+          Lossy compression: None
+          Integrity manifests: SHA-256
+          EOF
+
+      - name: Upload Processed Game Data
+        run: |
+          set -euo pipefail
+
+          GAME_ID="${{ steps.metadata.outputs.game_id }}"
+
+          rclone sync \
+            "$RUNNER_TEMP/full_game/" \
+            "gdrive:Games_Unpacked/$GAME_ID" \
+            --transfers 8 \
+            --checkers 16 \
+            --tpslimit 8 \
+            --tpslimit-burst 8 \
+            --drive-chunk-size 64M \
+            --create-empty-src-dirs \
+            --stats 30s \
+            --stats-one-line
+
+      - name: Upload Engine Shell
+        run: |
+          set -euo pipefail
+
+          GAME_ID="${{ steps.metadata.outputs.game_id }}"
+
+          rclone sync \
+            "$RUNNER_TEMP/engine_shell/" \
+            "gdrive:Games_Shell/$GAME_ID" \
+            --transfers 8 \
+            --checkers 16 \
+            --tpslimit 8 \
+            --tpslimit-burst 8 \
+            --create-empty-src-dirs \
+            --stats 30s \
+            --stats-one-line
+
+      - name: Verify Remote Game Upload
+        run: |
+          set -euo pipefail
+
+          GAME_ID="${{ steps.metadata.outputs.game_id }}"
+
+          rclone check \
+            "$RUNNER_TEMP/full_game/" \
+            "gdrive:Games_Unpacked/$GAME_ID" \
+            --one-way \
+            --combined "$RUNNER_TEMP/metadata/full-check.txt"
+
+          rclone check \
+            "$RUNNER_TEMP/engine_shell/" \
+            "gdrive:Games_Shell/$GAME_ID" \
+            --one-way \
+            --combined "$RUNNER_TEMP/metadata/shell-check.txt"
+
+      - name: Upload Manifests & Save Structure
+        run: |
+          set -euo pipefail
+
+          GAME_ID="${{ steps.metadata.outputs.game_id }}"
+
+          rclone sync \
+            "$RUNNER_TEMP/metadata/" \
+            "gdrive:Games_Metadata/$GAME_ID" \
+            --transfers 4 \
+            --checkers 8 \
+            --tpslimit 8 \
+            --create-empty-src-dirs
+
+          rclone copy \
+            "$RUNNER_TEMP/full_game/game/saves/" \
+            "gdrive:Games/$GAME_ID/saves/" \
+            --create-empty-src-dirs \
+            --tpslimit 8
+
+      - name: Generate Processing Report
+        if: always()
+        run: |
+          {
+            echo "## Game Manager Report"
+            echo ""
+            echo "- Archive: $ARCHIVE_NAME"
+            echo "- Runner: GitHub Actions"
+            echo "- Processing: ${{ job.status }}"
+            echo ""
+
+            if [[ -d "$RUNNER_TEMP/full_game" ]]; then
+              echo "- Unpacked size: $(du -sh "$RUNNER_TEMP/full_game" | cut -f1)"
+              echo "- File count: $(find "$RUNNER_TEMP/full_game" -type f | wc -l)"
+            fi
+
+            if [[ -d "$RUNNER_TEMP/engine_shell" ]]; then
+              echo "- Shell size: $(du -sh "$RUNNER_TEMP/engine_shell" | cut -f1)"
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"
