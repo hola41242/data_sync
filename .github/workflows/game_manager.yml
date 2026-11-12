@@ -4,9 +4,9 @@ on:
   workflow_dispatch:
     inputs:
       archive_name:
-        description: 'Exact archive filename in gdrive:Games (e.g. Bonds-0.5-market.zip)'
+        description: 'Exact archive filename in gdrive:Games (e.g. CampusBonds-0.5-market.zip)'
         required: true
-        default: 'Bonds-0.5-market.zip'
+        default: 'CampusBonds-0.5-market.zip'
 
 jobs:
   build-game-architecture:
