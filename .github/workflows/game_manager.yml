@@ -1,0 +1,46 @@
+name: Game Manager (Unpack + Split + Save Structure)
+
+on:
+  workflow_dispatch:
+    inputs:
+      game_folder:
+        description: 'Folder inside gdrive:Games (e.g. CampusBonds-0.5-market)'
+        required: true
+        default: 'CampusBonds-0.5-market'
+
+jobs:
+  build-game-architecture:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Install Tools
+        run: |
+          curl https://rclone.org/install.sh | sudo bash
+          pip install unrpa
+
+      - name: Configure Rclone
+        run: |
+          mkdir -p ~/.config/rclone
+          echo "${{ secrets.RCLONE_CONFIG_BASE64 }}" | base64 -d > ~/.config/rclone/rclone.conf
+
+      - name: Pull Game & Existing Saves from Drive
+        run: |
+          mkdir -p full_game engine_shell
+          rclone copy "gdrive:Games/${{ github.event.inputs.game_folder }}" full_game/ --transfers 16 -P
+
+      - name: Unpack .rpa Archives (100% Byte-for-Byte Lossless)
+        run: |
+          find full_game -name "*.rpa" | while read rpa; do
+            dir=$(dirname "$rpa")
+            unrpa -mp "$dir" "$rpa" && rm -f "$rpa"
+          done
+
+      - name: Create Exact Engine Shell (Code + Saves Folder Only)
+        run: |
+          rsync -av --exclude='game/images' --exclude='game/videos' --exclude='game/video' --exclude='game/audio' --exclude='game/music' --exclude='game/sfx' --exclude='game/voice' full_game/ engine_shell/
+          mkdir -p engine_shell/game/saves
+
+      - name: Push Clean Architecture & Saves Back to Drive
+        run: |
+          rclone sync full_game/ "gdrive:Games_Unpacked/${{ github.event.inputs.game_folder }}" --transfers 16 --checkers 32 --drive-chunk-size 64M -P
+          rclone sync engine_shell/ "gdrive:Games_Shell/${{ github.event.inputs.game_folder }}" --transfers 16 -P
+          rclone copy engine_shell/game/saves/ "gdrive:Games/${{ github.event.inputs.game_folder }}/saves/" --create-empty-src-dirs
