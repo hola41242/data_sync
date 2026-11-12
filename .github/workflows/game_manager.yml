@@ -27,8 +27,7 @@ jobs:
       - name: Pull Single Archive from Drive (Fast 1-File Pull)
         run: |
           mkdir -p raw_extract full_game engine_shell
-          rclone copy "gdrive:Games/${{ github.event.inputs.archive_name }}" . --drive-chunk-size 128M -P
-
+          rclone copyto "gdrive:Games/${{ github.event.inputs.archive_name }}" "./${{ github.event.inputs.archive_name }}" --drive-chunk-size 128M -P
       - name: Extract Archive on GitHub SSD & Normalize Folder Structure
         run: |
           ARCHIVE="${{ github.event.inputs.archive_name }}"
