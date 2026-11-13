@@ -22,12 +22,17 @@ jobs:
       - name: Checkout Repo
         uses: actions/checkout@v4
 
-      - name: Install Tools & Official Ren'Py Web Runtime
+      - name: Install Tools, rpatool & Official Ren'Py Web Runtime
         run: |
           sudo apt-get update
-          sudo apt-get install -y p7zip-full unrar wget zip python3
+          sudo apt-get install -y p7zip-full unrar wget zip unzip python3
           curl https://rclone.org/install.sh | sudo bash
 
+          # Lossless RPA unpacker (zero re-encoding)
+          wget -q "https://raw.githubusercontent.com/Shizmob/rpatool/master/rpatool" -O /usr/local/bin/rpatool
+          chmod +x /usr/local/bin/rpatool
+
+          # Official Ren'Py Web Runtime
           RENPY_VER="8.3.4"
           wget -q "https://www.renpy.org/dl/${RENPY_VER}/renpy-${RENPY_VER}-web.zip"
           unzip -q "renpy-${RENPY_VER}-web.zip" -d web_runtime/
@@ -37,9 +42,9 @@ jobs:
           mkdir -p ~/.config/rclone
           echo "${{ secrets.RCLONE_CONFIG_BASE64 }}" | base64 -d > ~/.config/rclone/rclone.conf
 
-      - name: Pull & Package Lossless Game (Zero Re-encoding)
+      - name: Pull, Unpack & Build Progressive Chunks (0% Loss)
         run: |
-          mkdir -p raw_extract game_src web_out
+          mkdir -p raw_extract game_src web_out chunks_out
           rclone copyto "gdrive:Games/${{ github.event.inputs.archive_name }}" "./${{ github.event.inputs.archive_name }}" --multi-thread-streams 8 --drive-chunk-size 128M -P
           7z x "${{ github.event.inputs.archive_name }}" -oraw_extract -y || unrar x -y "${{ github.event.inputs.archive_name }}" raw_extract/
           rm -f "${{ github.event.inputs.archive_name }}"
@@ -53,77 +58,227 @@ jobs:
             mv raw_extract/* game_src/
           fi
 
+          # Unpack all .rpa archives losslessly so Ren'Py streams individual scenes on-demand
+          find game_src/game -name "*.rpa" | sort | while read -r rpa; do
+            echo "Unpacking $rpa..."
+            python3 /usr/local/bin/rpatool -x "$rpa" -o game_src/game/
+            rm -f "$rpa"
+          done
+
+          # Copy Ren'Py Web runtime
           RUNTIME_DIR=$(dirname "$(find web_runtime -name "index.html" | head -n 1)")
           cp -r "$RUNTIME_DIR"/* web_out/
 
-          cd game_src
-          zip -0 -r ../web_out/game.zip game/
-          cd ..
+          # Split game assets into ~180 MB progressive chunks + generate progressive_download.txt
+          python3 - <<'EOF'
+          import os, zipfile, json
+
+          game_dir = "game_src/game"
+          boot_zip = "web_out/game.zip"
+          chunks_dir = "chunks_out"
+          MAX_CHUNK_BYTES = 180 * 1024 * 1024  # ~180 MB per progressive chunk
+
+          # Core files needed for instant 2-second boot
+          BOOT_EXTS = {'.rpy', '.rpyc', '.rpym', '.rpymc', '.rpyb', '.ttf', '.otf', '.txt', '.json'}
+
+          boot_files = []
+          heavy_files = []
+
+          for root, _, files in os.walk(game_dir):
+            for fname in sorted(files):
+              full_path = os.path.join(root, fname)
+              rel_path = os.path.relpath(full_path, "game_src")  # starts with game/...
+              ext = os.path.splitext(fname)[1].lower()
+              size = os.path.getsize(full_path)
+              if ext in BOOT_EXTS or size < 150 * 1024:
+                boot_files.append((full_path, rel_path))
+              else:
+                heavy_files.append((full_path, rel_path, size))
+
+          # Sort heavy files naturally so episodes/scenes stream in chronological order
+          heavy_files.sort(key=lambda x: x[1])
+
+          # 1. Create lightweight boot game.zip (ZIP_STORED = 0% compression)
+          with zipfile.ZipFile(boot_zip, 'w', compression=zipfile.ZIP_STORED) as zf:
+            for full_path, rel_path in boot_files:
+              zf.write(full_path, rel_path)
+
+          # 2. Pack heavy media into ~180 MB progressive chunks & build manifest
+          manifest = {}  # rel_path -> chunk_filename
+          chunk_idx = 0
+          cur_size = 0
+          cur_zip = None
+          cur_name = None
+
+          def open_next_chunk(idx):
+            cname = f"chunk_{idx:03d}.zip"
+            cpath = os.path.join(chunks_dir, cname)
+            return cname, zipfile.ZipFile(cpath, 'w', compression=zipfile.ZIP_STORED)
+
+          if heavy_files:
+            cur_name, cur_zip = open_next_chunk(chunk_idx)
+            for full_path, rel_path, size in heavy_files:
+              if cur_size > 0 and (cur_size + size) > MAX_CHUNK_BYTES:
+                cur_zip.close()
+                chunk_idx += 1
+                cur_size = 0
+                cur_name, cur_zip = open_next_chunk(chunk_idx)
+              cur_zip.write(full_path, rel_path)
+              manifest[rel_path] = cur_name
+              cur_size += size
+            cur_zip.close()
+
+          # Write Ren'Py native progressive_download.txt inside game.zip
+          prog_lines = ["+ game/**"]
+          with zipfile.ZipFile(boot_zip, 'a', compression=zipfile.ZIP_STORED) as zf:
+            zf.writestr("game/progressive_download.txt", "\n".join(prog_lines) + "\n")
+
+          with open("web_out/stream_manifest.json", "w", encoding="utf-8") as f:
+            json.dump(manifest, f)
+
+          print(f"Boot zip size: {os.path.getsize(boot_zip) / (1024*1024):.1f} MB | Progressive chunks: {chunk_idx + 1}")
+          EOF
+
           rm -rf raw_extract game_src
 
-      - name: Upload Heavy Assets to GitHub Releases & Clean web_out
+      - name: Upload Progressive Chunks to GitHub Releases & Inject 1GB FIFO Buffer
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           SLUG="${{ github.event.inputs.game_slug }}"
           TAG="game-${SLUG}"
           REPO="${{ github.repository }}"
+          WORKER="https://gh-cors-proxy.shubhamyadav39275000.workers.dev"
 
           gh release delete "$TAG" --yes --cleanup-tag || true
-          gh release create "$TAG" --title "Game Stream: $SLUG" --notes "Lossless assets for $SLUG"
+          gh release create "$TAG" --title "Progressive Stream: $SLUG" --notes "Lossless progressive chunks for $SLUG"
 
-          SIZE=$(stat -c%s "web_out/game.zip")
-          if [ "$SIZE" -gt 1900000000 ]; then
-            split -b 1900M -d "web_out/game.zip" "web_out/game.zip.part"
-            rm -f "web_out/game.zip"
-            PARTS=$(ls web_out/game.zip.part* | xargs -n1 basename)
-            gh release upload "$TAG" web_out/game.zip.part*
-            rm -f web_out/game.zip.part*
-          else
-            PARTS="game.zip"
-            gh release upload "$TAG" "web_out/game.zip"
-            rm -f "web_out/game.zip"
+          if ls chunks_out/chunk_*.zip 1> /dev/null 2>&1; then
+            gh release upload "$TAG" chunks_out/chunk_*.zip
           fi
+          rm -rf chunks_out
 
           python3 - <<EOF
           import json
-          parts = """$PARTS""".strip().split()
-          urls = [f"https://gh-cors-proxy.shubhamyadav39275000.workers.dev/?url=https://github.com/$REPO/releases/download/$TAG/{p}" for p in parts]
+
+          with open("web_out/stream_manifest.json", "r", encoding="utf-8") as f:
+            manifest = json.load(f)
+
+          chunks = sorted(list(set(manifest.values())))
+          base_url = "$WORKER/?url=https://github.com/$REPO/releases/download/$TAG"
+
           hook = f"""
+          <script src="https://cdn.jsdelivr.net/npm/fflate@0.8.2/umd/index.js"></script>
           <script>
           (function() {{
-            const PART_URLS = {json.dumps(urls)};
+            const BASE_URL = "{base_url}";
+            const MANIFEST = {json.dumps(manifest)};
+            const ALL_CHUNKS = {json.dumps(chunks)};
+            const MAX_BUFFER_BYTES = 1024 * 1024 * 1024; // 1 GB Rolling FIFO Buffer
+
+            // chunkName -> {{ files: Map<relPath, Uint8Array>, size: number, lastUsed: number }}
+            const fifoCache = new Map();
+            const inflightChunks = new Map();
+            let currentBufferBytes = 0;
+
+            function evictIfNeeded(neededBytes) {{
+              while (currentBufferBytes + neededBytes > MAX_BUFFER_BYTES && fifoCache.size > 0) {{
+                // Evict oldest-used chunk (FIFO / LRU)
+                let oldestKey = null;
+                let oldestTime = Infinity;
+                for (const [k, v] of fifoCache.entries()) {{
+                  if (v.lastUsed < oldestTime) {{
+                    oldestTime = v.lastUsed;
+                    oldestKey = k;
+                  }}
+                }}
+                if (!oldestKey) break;
+                const removed = fifoCache.get(oldestKey);
+                currentBufferBytes -= removed.size;
+                fifoCache.delete(oldestKey);
+              }}
+            }}
+
+            async function loadChunk(chunkName) {{
+              if (fifoCache.has(chunkName)) {{
+                const entry = fifoCache.get(chunkName);
+                entry.lastUsed = Date.now();
+                return entry;
+              }}
+              if (inflightChunks.has(chunkName)) {{
+                return inflightChunks.get(chunkName);
+              }}
+
+              const promise = (async () => {{
+                const res = await origFetch(`${{BASE_URL}}/${{chunkName}}`);
+                const buf = new Uint8Array(await res.arrayBuffer());
+                const unzipped = fflate.unzipSync(buf);
+                const fileMap = new Map();
+                let totalSize = 0;
+                for (const [path, data] of Object.entries(unzipped)) {{
+                  fileMap.set(path, data);
+                  totalSize += data.byteLength;
+                }}
+                evictIfNeeded(totalSize);
+                const entry = {{ files: fileMap, size: totalSize, lastUsed: Date.now() }};
+                fifoCache.set(chunkName, entry);
+                currentBufferBytes += totalSize;
+                inflightChunks.delete(chunkName);
+
+                // Background lookahead preload of next 2 chunks (~360 MB) for zero-lag Skip
+                const idx = ALL_CHUNKS.indexOf(chunkName);
+                if (idx !== -1) {{
+                  for (let next = idx + 1; next <= idx + 2 && next < ALL_CHUNKS.length; next++) {{
+                    const nextName = ALL_CHUNKS[next];
+                    if (!fifoCache.has(nextName) && !inflightChunks.has(nextName) && (currentBufferBytes + 200*1024*1024) <= MAX_BUFFER_BYTES) {{
+                      loadChunk(nextName).catch(() => {{}});
+                    }}
+                  }}
+                }}
+                return entry;
+              }})();
+
+              inflightChunks.set(chunkName, promise);
+              return promise;
+            }}
+
+            // Warm up first chunk silently right after boot
+            window.addEventListener('load', () => {{
+              if (ALL_CHUNKS.length > 0) {{
+                setTimeout(() => loadChunk(ALL_CHUNKS[0]).catch(() => {{}}), 1500);
+              }}
+            }});
+
             const origFetch = window.fetch;
             window.fetch = async function(resource, init) {{
-              const url = (typeof resource === 'string') ? resource : (resource && resource.url) || '';
-              if (url.endsWith('game.zip')) {{
-                const responses = await Promise.all(PART_URLS.map(u => origFetch(u)));
-                const streams = responses.map(r => r.body);
-                const combined = new ReadableStream({{
-                  async start(controller) {{
-                    for (const s of streams) {{
-                      const reader = s.getReader();
-                      while (true) {{
-                        const {{ done, value }} = await reader.read();
-                        if (done) break;
-                        controller.enqueue(value);
-                      }}
-                    }}
-                    controller.close();
-                  }}
-                }});
-                return new Response(combined, {{ headers: {{ 'Content-Type': 'application/zip' }} }});
+              const rawUrl = (typeof resource === 'string') ? resource : (resource && resource.url) || '';
+              const cleanPath = rawUrl.split('?')[0];
+              const matchKey = Object.keys(MANIFEST).find(k => cleanPath.endsWith('/' + k) || cleanPath === k);
+
+              if (matchKey) {{
+                const chunkName = MANIFEST[matchKey];
+                const entry = await loadChunk(chunkName);
+                const fileBytes = entry.files.get(matchKey);
+                if (fileBytes) {{
+                  return new Response(fileBytes, {{
+                    status: 200,
+                    headers: {{ 'Content-Type': 'application/octet-stream' }}
+                  }});
+                }}
               }}
               return origFetch.apply(this, arguments);
             }};
           }})();
           </script>
           """
+
           with open("web_out/index.html", "r", encoding="utf-8") as f:
             html = f.read()
           html = html.replace("<head>", "<head>" + hook, 1)
           with open("web_out/index.html", "w", encoding="utf-8") as f:
             f.write(html)
+
+          os.remove("web_out/stream_manifest.json")
           EOF
 
       - name: Deploy Lightweight Loader to GitHub Pages (24/7 Live)
