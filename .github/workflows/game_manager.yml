@@ -4,9 +4,9 @@ on:
   workflow_dispatch:
     inputs:
       archive_name:
-        description: 'Archive filename inside gdrive:Games (e.g. CampusBonds-0.5-market.zip)'
+        description: 'Archive filename inside gdrive:Games (e.g. Bonds-0.5-market.zip)'
         required: true
-        default: 'CampusBonds-0.5-market.zip'
+        default: 'Bonds-0.5-market.zip'
       game_slug:
         description: 'Clean URL folder name (lowercase, no spaces, e.g. campusbonds)'
         required: true
@@ -26,13 +26,9 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y p7zip-full unrar wget zip unzip python3
-          curl https://rclone.org/install.sh | sudo bash
-
-          # Lossless RPA unpacker (zero re-encoding)
+          curl -fsSL https://rclone.org/install.sh | sudo bash
           wget -q "https://raw.githubusercontent.com/Shizmob/rpatool/master/rpatool" -O /usr/local/bin/rpatool
           chmod +x /usr/local/bin/rpatool
-
-          # Official Ren'Py Web Runtime
           RENPY_VER="8.3.4"
           wget -q "https://www.renpy.org/dl/${RENPY_VER}/renpy-${RENPY_VER}-web.zip"
           unzip -q "renpy-${RENPY_VER}-web.zip" -d web_runtime/
@@ -58,114 +54,106 @@ jobs:
             mv raw_extract/* game_src/
           fi
 
-          # Unpack all .rpa archives losslessly so Ren'Py streams individual scenes on-demand
           find game_src/game -name "*.rpa" | sort | while read -r rpa; do
             echo "Unpacking $rpa..."
             python3 /usr/local/bin/rpatool -x "$rpa" -o game_src/game/
             rm -f "$rpa"
           done
 
-          # Copy Ren'Py Web runtime
           RUNTIME_DIR=$(dirname "$(find web_runtime -name "index.html" | head -n 1)")
           cp -r "$RUNTIME_DIR"/* web_out/
 
-          # Split game assets into ~180 MB progressive chunks + generate progressive_download.txt
-          python3 - <<'EOF'
+          cat << 'PYSCRIPT' > pack_chunks.py
           import os, zipfile, json
 
           game_dir = "game_src/game"
           boot_zip = "web_out/game.zip"
           chunks_dir = "chunks_out"
-          MAX_CHUNK_BYTES = 180 * 1024 * 1024  # ~180 MB per progressive chunk
+          MAX_CHUNK_BYTES = 180 * 1024 * 1024
 
-          # Core files needed for instant 2-second boot
           BOOT_EXTS = {'.rpy', '.rpyc', '.rpym', '.rpymc', '.rpyb', '.ttf', '.otf', '.txt', '.json'}
-
           boot_files = []
           heavy_files = []
 
           for root, _, files in os.walk(game_dir):
-            for fname in sorted(files):
-              full_path = os.path.join(root, fname)
-              rel_path = os.path.relpath(full_path, "game_src")  # starts with game/...
-              ext = os.path.splitext(fname)[1].lower()
-              size = os.path.getsize(full_path)
-              if ext in BOOT_EXTS or size < 150 * 1024:
-                boot_files.append((full_path, rel_path))
-              else:
-                heavy_files.append((full_path, rel_path, size))
+              for fname in sorted(files):
+                  full_path = os.path.join(root, fname)
+                  rel_path = os.path.relpath(full_path, "game_src")
+                  ext = os.path.splitext(fname)[1].lower()
+                  size = os.path.getsize(full_path)
+                  if ext in BOOT_EXTS or size < 150 * 1024:
+                      boot_files.append((full_path, rel_path))
+                  else:
+                      heavy_files.append((full_path, rel_path, size))
 
-          # Sort heavy files naturally so episodes/scenes stream in chronological order
           heavy_files.sort(key=lambda x: x[1])
 
-          # 1. Create lightweight boot game.zip (ZIP_STORED = 0% compression)
           with zipfile.ZipFile(boot_zip, 'w', compression=zipfile.ZIP_STORED) as zf:
-            for full_path, rel_path in boot_files:
-              zf.write(full_path, rel_path)
+              for full_path, rel_path in boot_files:
+                  zf.write(full_path, rel_path)
+              zf.writestr("game/progressive_download.txt", "+ game/**\n")
 
-          # 2. Pack heavy media into ~180 MB progressive chunks & build manifest
-          manifest = {}  # rel_path -> chunk_filename
+          manifest = {}
           chunk_idx = 0
           cur_size = 0
           cur_zip = None
           cur_name = None
 
           def open_next_chunk(idx):
-            cname = f"chunk_{idx:03d}.zip"
-            cpath = os.path.join(chunks_dir, cname)
-            return cname, zipfile.ZipFile(cpath, 'w', compression=zipfile.ZIP_STORED)
+              cname = f"chunk_{idx:03d}.zip"
+              cpath = os.path.join(chunks_dir, cname)
+              return cname, zipfile.ZipFile(cpath, 'w', compression=zipfile.ZIP_STORED)
 
           if heavy_files:
-            cur_name, cur_zip = open_next_chunk(chunk_idx)
-            for full_path, rel_path, size in heavy_files:
-              if cur_size > 0 and (cur_size + size) > MAX_CHUNK_BYTES:
-                cur_zip.close()
-                chunk_idx += 1
-                cur_size = 0
-                cur_name, cur_zip = open_next_chunk(chunk_idx)
-              cur_zip.write(full_path, rel_path)
-              manifest[rel_path] = cur_name
-              cur_size += size
-            cur_zip.close()
-
-          # Write Ren'Py native progressive_download.txt inside game.zip
-          prog_lines = ["+ game/**"]
-          with zipfile.ZipFile(boot_zip, 'a', compression=zipfile.ZIP_STORED) as zf:
-            zf.writestr("game/progressive_download.txt", "\n".join(prog_lines) + "\n")
+              cur_name, cur_zip = open_next_chunk(chunk_idx)
+              for full_path, rel_path, size in heavy_files:
+                  if cur_size > 0 and (cur_size + size) > MAX_CHUNK_BYTES:
+                      cur_zip.close()
+                      chunk_idx += 1
+                      cur_size = 0
+                      cur_name, cur_zip = open_next_chunk(chunk_idx)
+                  cur_zip.write(full_path, rel_path)
+                  manifest[rel_path] = cur_name
+                  cur_size += size
+              cur_zip.close()
 
           with open("web_out/stream_manifest.json", "w", encoding="utf-8") as f:
-            json.dump(manifest, f)
+              json.dump(manifest, f)
 
-          print(f"Boot zip size: {os.path.getsize(boot_zip) / (1024*1024):.1f} MB | Progressive chunks: {chunk_idx + 1}")
-          EOF
+          print(f"Boot zip: {os.path.getsize(boot_zip)/(1024*1024):.1f} MB | Chunks: {chunk_idx + 1}")
+          PYSCRIPT
 
-          rm -rf raw_extract game_src
+          python3 pack_chunks.py
+          rm -rf raw_extract game_src pack_chunks.py
 
       - name: Upload Progressive Chunks to GitHub Releases & Inject 1GB FIFO Buffer
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GAME_SLUG: ${{ github.event.inputs.game_slug }}
+          REPO_NAME: ${{ github.repository }}
         run: |
-          SLUG="${{ github.event.inputs.game_slug }}"
-          TAG="game-${SLUG}"
-          REPO="${{ github.repository }}"
-          WORKER="https://gh-cors-proxy.shubhamyadav39275000.workers.dev"
-
+          TAG="game-${GAME_SLUG}"
           gh release delete "$TAG" --yes --cleanup-tag || true
-          gh release create "$TAG" --title "Progressive Stream: $SLUG" --notes "Lossless progressive chunks for $SLUG"
+          gh release create "$TAG" --title "Progressive Stream: $GAME_SLUG" --notes "Lossless progressive chunks"
 
           if ls chunks_out/chunk_*.zip 1> /dev/null 2>&1; then
             gh release upload "$TAG" chunks_out/chunk_*.zip
           fi
           rm -rf chunks_out
 
-          python3 - <<EOF
-          import json
+          cat << 'INJECTPY' > inject_loader.py
+          import os, json
+
+          slug = os.environ["GAME_SLUG"]
+          repo = os.environ["REPO_NAME"]
+          tag = f"game-{slug}"
+          worker = "https://gh-cors-proxy.shubhamyadav39275000.workers.dev"
+          base_url = f"{worker}/?url=https://github.com/{repo}/releases/download/{tag}"
 
           with open("web_out/stream_manifest.json", "r", encoding="utf-8") as f:
-            manifest = json.load(f)
+              manifest = json.load(f)
 
           chunks = sorted(list(set(manifest.values())))
-          base_url = "$WORKER/?url=https://github.com/$REPO/releases/download/$TAG"
 
           hook = f"""
           <script src="https://cdn.jsdelivr.net/npm/fflate@0.8.2/umd/index.js"></script>
@@ -174,16 +162,14 @@ jobs:
             const BASE_URL = "{base_url}";
             const MANIFEST = {json.dumps(manifest)};
             const ALL_CHUNKS = {json.dumps(chunks)};
-            const MAX_BUFFER_BYTES = 1024 * 1024 * 1024; // 1 GB Rolling FIFO Buffer
+            const MAX_BUFFER_BYTES = 1024 * 1024 * 1024;
 
-            // chunkName -> {{ files: Map<relPath, Uint8Array>, size: number, lastUsed: number }}
             const fifoCache = new Map();
             const inflightChunks = new Map();
             let currentBufferBytes = 0;
 
             function evictIfNeeded(neededBytes) {{
               while (currentBufferBytes + neededBytes > MAX_BUFFER_BYTES && fifoCache.size > 0) {{
-                // Evict oldest-used chunk (FIFO / LRU)
                 let oldestKey = null;
                 let oldestTime = Infinity;
                 for (const [k, v] of fifoCache.entries()) {{
@@ -225,7 +211,6 @@ jobs:
                 currentBufferBytes += totalSize;
                 inflightChunks.delete(chunkName);
 
-                // Background lookahead preload of next 2 chunks (~360 MB) for zero-lag Skip
                 const idx = ALL_CHUNKS.indexOf(chunkName);
                 if (idx !== -1) {{
                   for (let next = idx + 1; next <= idx + 2 && next < ALL_CHUNKS.length; next++) {{
@@ -242,7 +227,6 @@ jobs:
               return promise;
             }}
 
-            // Warm up first chunk silently right after boot
             window.addEventListener('load', () => {{
               if (ALL_CHUNKS.length > 0) {{
                 setTimeout(() => loadChunk(ALL_CHUNKS[0]).catch(() => {{}}), 1500);
@@ -273,13 +257,16 @@ jobs:
           """
 
           with open("web_out/index.html", "r", encoding="utf-8") as f:
-            html = f.read()
+              html = f.read()
           html = html.replace("<head>", "<head>" + hook, 1)
           with open("web_out/index.html", "w", encoding="utf-8") as f:
-            f.write(html)
+              f.write(html)
 
           os.remove("web_out/stream_manifest.json")
-          EOF
+          INJECTPY
+
+          python3 inject_loader.py
+          rm -f inject_loader.py
 
       - name: Deploy Lightweight Loader to GitHub Pages (24/7 Live)
         uses: peaceiris/actions-gh-pages@v4
