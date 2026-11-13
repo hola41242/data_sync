@@ -1,4 +1,4 @@
-name: Build Lossless RenPy Web Library (24/7 Playnite Stream)
+name: Universal RenPy Lossless Web Streamer (24/7 Playnite)
 
 on:
   workflow_dispatch:
@@ -16,29 +16,37 @@ permissions:
   contents: write
 
 jobs:
-  build-lossless-web:
+  build-universal-web:
     runs-on: ubuntu-latest
     steps:
       - name: Checkout Repo
         uses: actions/checkout@v4
 
-      - name: Install Tools, rpatool & Official Ren'Py Web Runtime
+      - name: Install Tools, rpatool & Official Ren'Py SDK (Universal Builder)
         run: |
           sudo apt-get update
-          sudo apt-get install -y p7zip-full unrar wget zip unzip python3
+          sudo apt-get install -y p7zip-full unrar wget zip unzip python3 tar bzip2
           curl -fsSL https://rclone.org/install.sh | sudo bash
+
           wget -q "https://raw.githubusercontent.com/Shizmob/rpatool/master/rpatool" -O /usr/local/bin/rpatool
           chmod +x /usr/local/bin/rpatool
+
           RENPY_VER="8.3.4"
+          wget -q "https://www.renpy.org/dl/${RENPY_VER}/renpy-${RENPY_VER}-sdk.tar.bz2"
+          tar -xjf "renpy-${RENPY_VER}-sdk.tar.bz2"
+          mv "renpy-${RENPY_VER}-sdk" renpy_sdk
+          rm -f "renpy-${RENPY_VER}-sdk.tar.bz2"
+
           wget -q "https://www.renpy.org/dl/${RENPY_VER}/renpy-${RENPY_VER}-web.zip"
-          unzip -q "renpy-${RENPY_VER}-web.zip" -d web_runtime/
+          unzip -q "renpy-${RENPY_VER}-web.zip" -d renpy_sdk/web/
+          rm -f "renpy-${RENPY_VER}-web.zip"
 
       - name: Configure Rclone
         run: |
           mkdir -p ~/.config/rclone
           echo "${{ secrets.RCLONE_CONFIG_BASE64 }}" | base64 -d > ~/.config/rclone/rclone.conf
 
-      - name: Pull, Unpack & Build Progressive Chunks (0% Loss)
+      - name: Pull Game, Auto-Compile Universal Web Build & Split 180MB Chunks
         run: |
           mkdir -p raw_extract game_src web_out chunks_out
           rclone copyto "gdrive:Games/${{ github.event.inputs.archive_name }}" "./${{ github.event.inputs.archive_name }}" --multi-thread-streams 8 --drive-chunk-size 128M -P
@@ -54,45 +62,44 @@ jobs:
             mv raw_extract/* game_src/
           fi
 
+          # Unpack all .rpa archives losslessly so Ren'Py SDK indexes every asset for streaming
           find game_src/game -name "*.rpa" | sort | while read -r rpa; do
-            echo "Unpacking $rpa..."
+            echo "Losslessly unpacking $rpa..."
             python3 /usr/local/bin/rpatool -x "$rpa" -o game_src/game/
             rm -f "$rpa"
           done
 
-          RUNTIME_DIR=$(dirname "$(find web_runtime -name "index.html" | head -n 1)")
-          cp -r "$RUNTIME_DIR"/* web_out/
+          # Enable Ren'Py native progressive download for all media assets
+          cat << 'PROGTXT' > game_src/game/progressive_download.txt
+          - game/**.rpy
+          - game/**.rpyc
+          - game/**.rpyb
+          - game/**.ttf
+          - game/**.otf
+          + game/**
+          PROGTXT
 
+          # Universal Ren'Py SDK Web Build (auto-generates main.py, engine files & small boot game.zip)
+          ./renpy_sdk/renpy.sh ./renpy_sdk/launcher web_build game_src --destination web_out
+
+          # Pack unpacked progressive media (web_out/game/*) into ~180 MB lossless chunks
           cat << 'PYSCRIPT' > pack_chunks.py
-          import os, zipfile, json
+          import os, zipfile, json, shutil
 
-          game_dir = "game_src/game"
-          boot_zip = "web_out/game.zip"
+          prog_dir = "web_out/game"
           chunks_dir = "chunks_out"
           MAX_CHUNK_BYTES = 180 * 1024 * 1024
 
-          # ONLY pure code/fonts/config in game.zip (keeps it ~10-20 MB, well under GitHub's 100 MB limit)
-          BOOT_EXTS = {'.rpy', '.rpyc', '.rpym', '.rpymc', '.rpyb', '.ttf', '.otf', '.txt', '.json'}
-          boot_files = []
           heavy_files = []
-
-          for root, _, files in os.walk(game_dir):
-              for fname in sorted(files):
-                  full_path = os.path.join(root, fname)
-                  rel_path = os.path.relpath(full_path, "game_src")
-                  ext = os.path.splitext(fname)[1].lower()
-                  size = os.path.getsize(full_path)
-                  if ext in BOOT_EXTS:
-                      boot_files.append((full_path, rel_path))
-                  else:
+          if os.path.exists(prog_dir):
+              for root, _, files in os.walk(prog_dir):
+                  for fname in sorted(files):
+                      full_path = os.path.join(root, fname)
+                      rel_path = os.path.relpath(full_path, "web_out")  # e.g. game/images/bg1.png
+                      size = os.path.getsize(full_path)
                       heavy_files.append((full_path, rel_path, size))
 
           heavy_files.sort(key=lambda x: x[1])
-
-          with zipfile.ZipFile(boot_zip, 'w', compression=zipfile.ZIP_STORED) as zf:
-              for full_path, rel_path in boot_files:
-                  zf.write(full_path, rel_path)
-              zf.writestr("game/progressive_download.txt", "+ game/**\n")
 
           manifest = {}
           chunk_idx = 0
@@ -118,14 +125,18 @@ jobs:
                   cur_size += size
               cur_zip.close()
 
+          # Remove heavy media from web_out/game so GitHub Pages stays tiny (<30 MB)
+          if os.path.exists(prog_dir):
+              shutil.rmtree(prog_dir)
+
           with open("web_out/stream_manifest.json", "w", encoding="utf-8") as f:
               json.dump(manifest, f)
 
-          print("Boot zip MB:", round(os.path.getsize(boot_zip) / (1024 * 1024), 1), "| Chunks:", chunk_idx + 1)
+          print("Boot game.zip MB:", round(os.path.getsize("web_out/game.zip") / (1024 * 1024), 1), "| Chunks:", chunk_idx + 1)
           PYSCRIPT
 
           python3 pack_chunks.py
-          rm -rf raw_extract game_src pack_chunks.py
+          rm -rf raw_extract game_src renpy_sdk pack_chunks.py
 
       - name: Upload Progressive Chunks to GitHub Releases & Inject 1GB FIFO Buffer
         env:
@@ -163,7 +174,7 @@ jobs:
             const BASE_URL = __BASE_URL__;
             const MANIFEST = __MANIFEST__;
             const ALL_CHUNKS = __CHUNKS__;
-            const MAX_BUFFER_BYTES = 1024 * 1024 * 1024;
+            const MAX_BUFFER_BYTES = 1024 * 1024 * 1024; // 1 GB Rolling FIFO Buffer
 
             const fifoCache = new Map();
             const inflightChunks = new Map();
@@ -212,6 +223,7 @@ jobs:
                 currentBufferBytes += totalSize;
                 inflightChunks.delete(chunkName);
 
+                // Background lookahead preload of next 2 chunks (~360 MB) for zero-lag Skip
                 const idx = ALL_CHUNKS.indexOf(chunkName);
                 if (idx !== -1) {
                   for (let next = idx + 1; next <= idx + 2 && next < ALL_CHUNKS.length; next++) {
@@ -230,14 +242,14 @@ jobs:
 
             window.addEventListener('load', () => {
               if (ALL_CHUNKS.length > 0) {
-                setTimeout(() => loadChunk(ALL_CHUNKS[0]).catch(() => {}), 1500);
+                setTimeout(() => loadChunk(ALL_CHUNKS[0]).catch(() => {}), 1000);
               }
             });
 
             const origFetch = window.fetch;
             window.fetch = async function(resource, init) {
               const rawUrl = (typeof resource === 'string') ? resource : (resource && resource.url) || '';
-              const cleanPath = rawUrl.split('?')[0];
+              const cleanPath = decodeURIComponent(rawUrl.split('?')[0]);
               const matchKey = Object.keys(MANIFEST).find(k => cleanPath.endsWith('/' + k) || cleanPath === k);
 
               if (matchKey) {
