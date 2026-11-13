@@ -4,9 +4,9 @@ on:
   workflow_dispatch:
     inputs:
       archive_name:
-        description: 'Archive filename inside gdrive:Games (e.g. Bonds-0.5-market.zip)'
+        description: 'Archive filename inside gdrive:Games (e.g. CampusBonds-0.5-market.zip)'
         required: true
-        default: 'Bonds-0.5-market.zip'
+        default: 'CampusBonds-0.5-market.zip'
       game_slug:
         description: 'Clean URL folder name (lowercase, no spaces, e.g. campusbonds)'
         required: true
@@ -120,7 +120,7 @@ jobs:
           with open("web_out/stream_manifest.json", "w", encoding="utf-8") as f:
               json.dump(manifest, f)
 
-          print(f"Boot zip: {os.path.getsize(boot_zip)/(1024*1024):.1f} MB | Chunks: {chunk_idx + 1}")
+          print("Boot zip MB:", round(os.path.getsize(boot_zip) / (1024 * 1024), 1), "| Chunks:", chunk_idx + 1)
           PYSCRIPT
 
           python3 pack_chunks.py
@@ -146,115 +146,120 @@ jobs:
 
           slug = os.environ["GAME_SLUG"]
           repo = os.environ["REPO_NAME"]
-          tag = f"game-{slug}"
+          tag = "game-" + slug
           worker = "https://gh-cors-proxy.shubhamyadav39275000.workers.dev"
-          base_url = f"{worker}/?url=https://github.com/{repo}/releases/download/{tag}"
+          base_url = worker + "/?url=https://github.com/" + repo + "/releases/download/" + tag
 
           with open("web_out/stream_manifest.json", "r", encoding="utf-8") as f:
               manifest = json.load(f)
 
           chunks = sorted(list(set(manifest.values())))
 
-          hook = f"""
+          js_template = """
           <script src="https://cdn.jsdelivr.net/npm/fflate@0.8.2/umd/index.js"></script>
           <script>
-          (function() {{
-            const BASE_URL = "{base_url}";
-            const MANIFEST = {json.dumps(manifest)};
-            const ALL_CHUNKS = {json.dumps(chunks)};
+          (function() {
+            const BASE_URL = __BASE_URL__;
+            const MANIFEST = __MANIFEST__;
+            const ALL_CHUNKS = __CHUNKS__;
             const MAX_BUFFER_BYTES = 1024 * 1024 * 1024;
 
             const fifoCache = new Map();
             const inflightChunks = new Map();
             let currentBufferBytes = 0;
 
-            function evictIfNeeded(neededBytes) {{
-              while (currentBufferBytes + neededBytes > MAX_BUFFER_BYTES && fifoCache.size > 0) {{
+            function evictIfNeeded(neededBytes) {
+              while (currentBufferBytes + neededBytes > MAX_BUFFER_BYTES && fifoCache.size > 0) {
                 let oldestKey = null;
                 let oldestTime = Infinity;
-                for (const [k, v] of fifoCache.entries()) {{
-                  if (v.lastUsed < oldestTime) {{
+                for (const [k, v] of fifoCache.entries()) {
+                  if (v.lastUsed < oldestTime) {
                     oldestTime = v.lastUsed;
                     oldestKey = k;
-                  }}
-                }}
+                  }
+                }
                 if (!oldestKey) break;
                 const removed = fifoCache.get(oldestKey);
                 currentBufferBytes -= removed.size;
                 fifoCache.delete(oldestKey);
-              }}
-            }}
+              }
+            }
 
-            async function loadChunk(chunkName) {{
-              if (fifoCache.has(chunkName)) {{
+            async function loadChunk(chunkName) {
+              if (fifoCache.has(chunkName)) {
                 const entry = fifoCache.get(chunkName);
                 entry.lastUsed = Date.now();
                 return entry;
-              }}
-              if (inflightChunks.has(chunkName)) {{
+              }
+              if (inflightChunks.has(chunkName)) {
                 return inflightChunks.get(chunkName);
-              }}
+              }
 
-              const promise = (async () => {{
-                const res = await origFetch(`${{BASE_URL}}/${{chunkName}}`);
+              const promise = (async () => {
+                const res = await origFetch(BASE_URL + "/" + chunkName);
                 const buf = new Uint8Array(await res.arrayBuffer());
                 const unzipped = fflate.unzipSync(buf);
                 const fileMap = new Map();
                 let totalSize = 0;
-                for (const [path, data] of Object.entries(unzipped)) {{
+                for (const [path, data] of Object.entries(unzipped)) {
                   fileMap.set(path, data);
                   totalSize += data.byteLength;
-                }}
+                }
                 evictIfNeeded(totalSize);
-                const entry = {{ files: fileMap, size: totalSize, lastUsed: Date.now() }};
+                const entry = { files: fileMap, size: totalSize, lastUsed: Date.now() };
                 fifoCache.set(chunkName, entry);
                 currentBufferBytes += totalSize;
                 inflightChunks.delete(chunkName);
 
                 const idx = ALL_CHUNKS.indexOf(chunkName);
-                if (idx !== -1) {{
-                  for (let next = idx + 1; next <= idx + 2 && next < ALL_CHUNKS.length; next++) {{
+                if (idx !== -1) {
+                  for (let next = idx + 1; next <= idx + 2 && next < ALL_CHUNKS.length; next++) {
                     const nextName = ALL_CHUNKS[next];
-                    if (!fifoCache.has(nextName) && !inflightChunks.has(nextName) && (currentBufferBytes + 200*1024*1024) <= MAX_BUFFER_BYTES) {{
-                      loadChunk(nextName).catch(() => {{}});
-                    }}
-                  }}
-                }}
+                    if (!fifoCache.has(nextName) && !inflightChunks.has(nextName) && (currentBufferBytes + 200*1024*1024) <= MAX_BUFFER_BYTES) {
+                      loadChunk(nextName).catch(() => {});
+                    }
+                  }
+                }
                 return entry;
-              }})();
+              })();
 
               inflightChunks.set(chunkName, promise);
               return promise;
-            }}
+            }
 
-            window.addEventListener('load', () => {{
-              if (ALL_CHUNKS.length > 0) {{
-                setTimeout(() => loadChunk(ALL_CHUNKS[0]).catch(() => {{}}), 1500);
-              }}
-            }});
+            window.addEventListener('load', () => {
+              if (ALL_CHUNKS.length > 0) {
+                setTimeout(() => loadChunk(ALL_CHUNKS[0]).catch(() => {}), 1500);
+              }
+            });
 
             const origFetch = window.fetch;
-            window.fetch = async function(resource, init) {{
+            window.fetch = async function(resource, init) {
               const rawUrl = (typeof resource === 'string') ? resource : (resource && resource.url) || '';
               const cleanPath = rawUrl.split('?')[0];
               const matchKey = Object.keys(MANIFEST).find(k => cleanPath.endsWith('/' + k) || cleanPath === k);
 
-              if (matchKey) {{
+              if (matchKey) {
                 const chunkName = MANIFEST[matchKey];
                 const entry = await loadChunk(chunkName);
                 const fileBytes = entry.files.get(matchKey);
-                if (fileBytes) {{
-                  return new Response(fileBytes, {{
+                if (fileBytes) {
+                  return new Response(fileBytes, {
                     status: 200,
-                    headers: {{ 'Content-Type': 'application/octet-stream' }}
-                  }});
-                }}
-              }}
+                    headers: { 'Content-Type': 'application/octet-stream' }
+                  });
+                }
+              }
               return origFetch.apply(this, arguments);
-            }};
-          }})();
+            };
+          })();
           </script>
           """
+
+          hook = (js_template
+                  .replace("__BASE_URL__", json.dumps(base_url))
+                  .replace("__MANIFEST__", json.dumps(manifest))
+                  .replace("__CHUNKS__", json.dumps(chunks)))
 
           with open("web_out/index.html", "r", encoding="utf-8") as f:
               html = f.read()
