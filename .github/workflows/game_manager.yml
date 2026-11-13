@@ -1,79 +1,98 @@
-name: Cloud Game Stream Server (Multi-Game WebDAV)
+name: Build Lossless RenPy Web Library (24/7 Playnite Stream)
 
 on:
   workflow_dispatch:
     inputs:
-      archive_names:
-        description: 'Comma-separated zip/rar names in gdrive:Games (e.g. CampusBonds-0.5-market.zip, Game2.zip)'
+      archive_name:
+        description: 'Archive filename inside gdrive:Games (e.g. CampusBonds-0.5-market.zip)'
         required: true
         default: 'CampusBonds-0.5-market.zip'
+      game_slug:
+        description: 'Clean URL folder name (lowercase, no spaces, e.g. bonds)'
+        required: true
+        default: 'campusbonds'
+
+permissions:
+  contents: write
 
 jobs:
-  stream-game:
+  build-lossless-web:
     runs-on: ubuntu-latest
-    timeout-minutes: 355
     steps:
-      - name: Install Tools & Ngrok
+      - name: Checkout Repo
+        uses: actions/checkout@v4
+
+      - name: Install Tools & Official Ren'Py SDK + Web Support
         run: |
           sudo apt-get update
-          sudo apt-get install -y p7zip-full unrar
+          sudo apt-get install -y p7zip-full unrar wget
           curl https://rclone.org/install.sh | sudo bash
-          curl -sSL https://ngrok-agent.s3.amazonaws.com/ngrok.asc | sudo tee /etc/apt/trusted.gpg.d/ngrok.asc >/dev/null
-          echo "deb https://ngrok-agent.s3.amazonaws.com buster main" | sudo tee /etc/apt/sources.list.d/ngrok.list
-          sudo apt-get update && sudo apt-get install -y ngrok
+
+          RENPY_VER="8.3.4"
+          wget -q "https://www.renpy.org/dl/${RENPY_VER}/renpy-${RENPY_VER}-sdk.tar.bz2"
+          tar -xf "renpy-${RENPY_VER}-sdk.tar.bz2"
+          mv "renpy-${RENPY_VER}-sdk" renpy_sdk
+
+          wget -q "https://www.renpy.org/dl/${RENPY_VER}/renpy-${RENPY_VER}-web.zip"
+          unzip -q "renpy-${RENPY_VER}-web.zip" -d renpy_sdk/
 
       - name: Configure Rclone
         run: |
           mkdir -p ~/.config/rclone
           echo "${{ secrets.RCLONE_CONFIG_BASE64 }}" | base64 -d > ~/.config/rclone/rclone.conf
 
-      - name: Pull & Prepare Games on GitHub Cloud SSD
+      - name: Pull & Extract Game (100% Original Lossless Assets)
         run: |
-          mkdir -p /tmp/game_root
-          IFS=',' read -ra ARCHIVES <<< "${{ github.event.inputs.archive_names }}"
-          for RAW_NAME in "${ARCHIVES[@]}"; do
-            ARCHIVE=$(echo "$RAW_NAME" | xargs)
-            GAME_FOLDER="${ARCHIVE%.*}"
-            mkdir -p raw_extract "/tmp/game_root/$GAME_FOLDER"
+          mkdir -p raw_extract game_src
+          rclone copyto "gdrive:Games/${{ github.event.inputs.archive_name }}" "./${{ github.event.inputs.archive_name }}" --multi-thread-streams 8 --drive-chunk-size 128M -P
+          7z x "${{ github.event.inputs.archive_name }}" -oraw_extract -y || unrar x -y "${{ github.event.inputs.archive_name }}" raw_extract/
+          rm -f "${{ github.event.inputs.archive_name }}"
 
-            rclone copyto "gdrive:Games/$ARCHIVE" "./$ARCHIVE" --multi-thread-streams 8 --drive-chunk-size 128M -P
-            7z x "$ARCHIVE" -oraw_extract -y || unrar x -y "$ARCHIVE" raw_extract/
-            rm -f "$ARCHIVE"
+          SUBDIRS=$(find raw_extract -mindepth 1 -maxdepth 1 -type d | wc -l)
+          FILES=$(find raw_extract -mindepth 1 -maxdepth 1 -type f | wc -l)
+          if [ "$SUBDIRS" -eq 1 ] && [ "$FILES" -eq 0 ]; then
+            INNER_DIR=$(find raw_extract -mindepth 1 -maxdepth 1 -type d)
+            mv "$INNER_DIR"/* game_src/
+          else
+            mv raw_extract/* game_src/
+          fi
 
-            SUBDIRS=$(find raw_extract -mindepth 1 -maxdepth 1 -type d | wc -l)
-            FILES=$(find raw_extract -mindepth 1 -maxdepth 1 -type f | wc -l)
-            if [ "$SUBDIRS" -eq 1 ] && [ "$FILES" -eq 0 ]; then
-              INNER_DIR=$(find raw_extract -mindepth 1 -maxdepth 1 -type d)
-              mv "$INNER_DIR"/* "/tmp/game_root/$GAME_FOLDER/"
+          # Mac/Linux extra binaries hatao (game assets untouched)
+          rm -rf game_src/*.app game_src/lib/py3-linux* game_src/lib/py3-mac* game_src/*.sh
+
+      - name: Build Lossless Progressive Web Package
+        run: |
+          mkdir -p web_out
+          ./renpy_sdk/renpy.sh ./renpy_sdk/launcher web_build ./game_src --destination ./web_out
+
+      - name: Upload Heavy Assets to GitHub Releases CDN (Bypass 1GB Pages Limit)
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          SLUG="${{ github.event.inputs.game_slug }}"
+          TAG="game-${SLUG}"
+
+          # Agar purana release ho toh delete karke fresh upload karo
+          gh release delete "$TAG" --yes --cleanup-tag || true
+          gh release create "$TAG" --title "Game Stream: $SLUG" --notes "Lossless assets for $SLUG"
+
+          # Agar game.zip 1.9 GB se bada hai toh 1.9 GB chunks mein split karo (0% compression)
+          if [ -f "web_out/game.zip" ]; then
+            SIZE=$(stat -c%s "web_out/game.zip")
+            if [ "$SIZE" -gt 1900000000 ]; then
+              split -b 1900M -d "web_out/game.zip" "web_out/game.zip.part"
+              rm -f "web_out/game.zip"
+              gh release upload "$TAG" web_out/game.zip.part*
             else
-              mv raw_extract/* "/tmp/game_root/$GAME_FOLDER/"
+              gh release upload "$TAG" "web_out/game.zip"
+              rm -f "web_out/game.zip"
             fi
-            rm -rf raw_extract/*
+          fi
 
-            # Extra Mac/Linux files hatao taaki Windows scan fast ho
-            rm -rf "/tmp/game_root/$GAME_FOLDER"/*.app "/tmp/game_root/$GAME_FOLDER"/lib/py3-linux* "/tmp/game_root/$GAME_FOLDER"/lib/py3-mac* "/tmp/game_root/$GAME_FOLDER"/*.sh
-
-            # Existing cloud saves restore karo
-            mkdir -p "/tmp/game_root/$GAME_FOLDER/game/saves"
-            rclone copy "gdrive:Games/$GAME_FOLDER/saves" "/tmp/game_root/$GAME_FOLDER/game/saves" --transfers 8 || true
-          done
-          chmod -R 777 /tmp/game_root
-
-      - name: Start High-Speed Docker WebDAV & Static Ngrok
-        run: |
-          docker run -d --name game_webdav -p 8080:8080 -v /tmp/game_root:/data rclone/rclone:latest serve webdav /data --addr :8080 --dir-cache-time 24h --vfs-cache-mode minimal --buffer-size 128M
-          ngrok config add-authtoken "${{ secrets.NGROK_AUTHTOKEN }}"
-          ngrok http 8080 --domain="${{ secrets.NGROK_DOMAIN }}" > /dev/null &
-          sleep 5
-          echo "LIVE STREAM READY AT: https://${{ secrets.NGROK_DOMAIN }}"
-
-      - name: Keep Alive & Auto-Sync All Saves Every 5 Minutes
-        run: |
-          END_TIME=$(( $(date +%s) + 20700 ))
-          while [ $(date +%s) -lt $END_TIME ]; do
-            sleep 300
-            for DIR in /tmp/game_root/*/; do
-              GAME_FOLDER=$(basename "$DIR")
-              rclone sync "/tmp/game_root/$GAME_FOLDER/game/saves" "gdrive:Games/$GAME_FOLDER/saves" --transfers 8 || true
-            done
-          done
+      - name: Deploy Lightweight Loader to GitHub Pages (24/7 Live)
+        uses: peaceiris/actions-gh-pages@v4
+        with:
+          github_token: ${{ secrets.GITHUB_TOKEN }}
+          publish_dir: ./web_out
+          destination_dir: ${{ github.event.inputs.game_slug }}
+          keep_files: true
