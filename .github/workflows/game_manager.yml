@@ -4,9 +4,9 @@ on:
   workflow_dispatch:
     inputs:
       archive_name:
-        description: 'Archive filename inside gdrive:Games (e.g. Bonds-0.5-market.zip)'
+        description: 'Archive filename inside gdrive:Games (e.g. CampusBonds-0.5-market.zip)'
         required: true
-        default: 'Bonds-0.5-market.zip'
+        default: 'CampusBonds-0.5-market.zip'
 
 jobs:
   stream-game:
