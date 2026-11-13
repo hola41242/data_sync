@@ -1,172 +1,75 @@
-
-name: Game Manager - Cloud Processing
+name: Cloud Game Stream Server (Docker WebDAV + Static Ngrok)
 
 on:
   workflow_dispatch:
     inputs:
       archive_name:
-        description: "ZIP filename in gdrive:Games"
+        description: 'Archive filename inside gdrive:Games (e.g. Bonds-0.5-market.zip)'
         required: true
-        default: "CampusBonds-0.5-market.zip"
-
-permissions:
-  contents: read
+        default: 'Bonds-0.5-market.zip'
 
 jobs:
-  process-game:
+  stream-game:
     runs-on: ubuntu-latest
-    timeout-minutes: 360
-
-    env:
-      ARCHIVE_NAME: ${{ inputs.archive_name }}
-      R2_ACCOUNT_ID: ${{ secrets.R2_ACCOUNT_ID }}
-      R2_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
-      R2_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
-      R2_BUCKET: ${{ secrets.R2_BUCKET }}
-
+    timeout-minutes: 355
     steps:
-      - name: Install tools
+      - name: Install Tools & Ngrok
         run: |
-          set -euo pipefail
           sudo apt-get update
-          sudo apt-get install -y p7zip-full
-          curl -fsSL https://rclone.org/install.sh | sudo bash
+          sudo apt-get install -y p7zip-full unrar
+          curl https://rclone.org/install.sh | sudo bash
+          pip install unrpa
+          curl -sSL https://ngrok-agent.s3.amazonaws.com/ngrok.asc | sudo tee /etc/apt/trusted.gpg.d/ngrok.asc >/dev/null
+          echo "deb https://ngrok-agent.s3.amazonaws.com buster main" | sudo tee /etc/apt/sources.list.d/ngrok.list
+          sudo apt-get update && sudo apt-get install -y ngrok
 
-      - name: Configure storage
+      - name: Configure Rclone
         run: |
-          set -euo pipefail
-
           mkdir -p ~/.config/rclone
+          echo "${{ secrets.RCLONE_CONFIG_BASE64 }}" | base64 -d > ~/.config/rclone/rclone.conf
 
-          printf '%s' '${{ secrets.RCLONE_CONFIG_BASE64 }}' \
-            | base64 -d > ~/.config/rclone/rclone.conf
-
-          chmod 600 ~/.config/rclone/rclone.conf
-
-          rclone config create r2 s3 \
-            provider Cloudflare \
-            access_key_id "$R2_ACCESS_KEY_ID" \
-            secret_access_key "$R2_SECRET_ACCESS_KEY" \
-            endpoint "https://$R2_ACCOUNT_ID.r2.cloudflarestorage.com" \
-            region auto
-
-          rclone lsd r2:"$R2_BUCKET"
-
-      - name: Validate archive
+      - name: Pull, Extract & Unpack Game on GitHub NVMe SSD
         run: |
-          set -euo pipefail
+          GAME_FOLDER="${{ github.event.inputs.archive_name }}"
+          GAME_FOLDER="${GAME_FOLDER%.*}"
+          mkdir -p raw_extract "/tmp/game_root/$GAME_FOLDER"
 
-          [[ "$ARCHIVE_NAME" == "$(basename "$ARCHIVE_NAME")" ]]
-          [[ "${ARCHIVE_NAME,,}" == *.zip ]]
+          rclone copyto "gdrive:Games/${{ github.event.inputs.archive_name }}" "./${{ github.event.inputs.archive_name }}" --multi-thread-streams 8 --drive-chunk-size 128M -P
+          7z x "${{ github.event.inputs.archive_name }}" -oraw_extract -y || unrar x -y "${{ github.event.inputs.archive_name }}" raw_extract/
+          rm -f "${{ github.event.inputs.archive_name }}"
 
-      - name: Download source ZIP
-        run: |
-          set -euo pipefail
-
-          rclone copyto \
-            "gdrive:Games/$ARCHIVE_NAME" \
-            "$RUNNER_TEMP/$ARCHIVE_NAME" \
-            --drive-chunk-size 128M \
-            --stats 30s
-
-          sha256sum "$RUNNER_TEMP/$ARCHIVE_NAME" \
-            > "$RUNNER_TEMP/source.sha256"
-
-      - name: Test and extract ZIP
-        run: |
-          set -euo pipefail
-
-          mkdir -p "$RUNNER_TEMP/game"
-
-          7z t "$RUNNER_TEMP/$ARCHIVE_NAME" -y
-
-          7z x "$RUNNER_TEMP/$ARCHIVE_NAME" \
-            "-o$RUNNER_TEMP/extracted" -y
-
-          shopt -s dotglob nullglob
-          entries=("$RUNNER_TEMP/extracted"/*)
-
-          if [[ ${#entries[@]} -eq 1 && -d "${entries[0]}" ]]; then
-            mv "${entries[0]}"/* "$RUNNER_TEMP/game/"
+          SUBDIRS=$(find raw_extract -mindepth 1 -maxdepth 1 -type d | wc -l)
+          FILES=$(find raw_extract -mindepth 1 -maxdepth 1 -type f | wc -l)
+          if [ "$SUBDIRS" -eq 1 ] && [ "$FILES" -eq 0 ]; then
+            INNER_DIR=$(find raw_extract -mindepth 1 -maxdepth 1 -type d)
+            mv "$INNER_DIR"/* "/tmp/game_root/$GAME_FOLDER/"
           else
-            mv "${entries[@]}" "$RUNNER_TEMP/game/"
+            mv raw_extract/* "/tmp/game_root/$GAME_FOLDER/"
           fi
 
-          test -n "$(find "$RUNNER_TEMP/game" -type f -print -quit)"
+          find "/tmp/game_root/$GAME_FOLDER" -name "*.rpa" | while read rpa; do
+            dir=$(dirname "$rpa")
+            unrpa -mp "$dir" "$rpa" && rm -f "$rpa"
+          done
 
-      - name: Preserve original RPA archives
+          mkdir -p "/tmp/game_root/$GAME_FOLDER/game/saves"
+          rclone copy "gdrive:Games/$GAME_FOLDER/saves" "/tmp/game_root/$GAME_FOLDER/game/saves" --transfers 8 || true
+          chmod -R 777 /tmp/game_root
+
+      - name: Start Docker WebDAV Server & Static Ngrok Tunnel
         run: |
-          set -euo pipefail
+          docker run -d --name game_webdav -p 8080:8080 -v /tmp/game_root:/data rclone/rclone:latest serve webdav /data --addr :8080 --vfs-cache-mode off
+          ngrok config add-authtoken "${{ secrets.NGROK_AUTHTOKEN }}"
+          ngrok http 8080 --domain="${{ secrets.NGROK_DOMAIN }}" > /dev/null &
+          sleep 5
+          echo "LIVE STREAM READY AT: https://${{ secrets.NGROK_DOMAIN }}"
 
-          COUNT=$(find "$RUNNER_TEMP/game" -type f -iname '*.rpa' | wc -l)
-
-          echo "Preserved RPA archives: $COUNT"
-          echo "No RPA unpacking or modification performed."
-
-      - name: Generate file integrity manifest
+      - name: Keep Alive & Auto-Sync Saves Every 5 Minutes
         run: |
-          set -euo pipefail
-
-          cd "$RUNNER_TEMP/game"
-
-          find . -type f -print0 \
-            | sort -z \
-            | xargs -0 -r sha256sum \
-            > "$RUNNER_TEMP/game.sha256"
-
-          echo "Files: $(wc -l < "$RUNNER_TEMP/game.sha256")"
-          echo "Game size: $(du -sh "$RUNNER_TEMP/game" | cut -f1)"
-
-      - name: Upload processed game to R2
-        run: |
-          set -euo pipefail
-
-          GAME_ID="${ARCHIVE_NAME%.zip}"
-
-          rclone copy \
-            "$RUNNER_TEMP/game/" \
-            "r2:$R2_BUCKET/games/$GAME_ID" \
-            --transfers 8 \
-            --checkers 16 \
-            --s3-chunk-size 64M \
-            --stats 15s \
-            --stats-one-line
-
-      - name: Upload integrity manifest
-        run: |
-          set -euo pipefail
-
-          GAME_ID="${ARCHIVE_NAME%.zip}"
-
-          rclone copyto \
-            "$RUNNER_TEMP/game.sha256" \
-            "r2:$R2_BUCKET/metadata/$GAME_ID.sha256"
-
-          rclone copyto \
-            "$RUNNER_TEMP/source.sha256" \
-            "r2:$R2_BUCKET/metadata/$GAME_ID-source.sha256"
-
-      - name: Verify remote files
-        run: |
-          set -euo pipefail
-
-          GAME_ID="${ARCHIVE_NAME%.zip}"
-
-          rclone check \
-            "$RUNNER_TEMP/game/" \
-            "r2:$R2_BUCKET/games/$GAME_ID" \
-            --one-way \
-            --download
-
-      - name: Processing report
-        if: always()
-        run: |
-          {
-            echo "## Game Processing"
-            echo "- Archive: $ARCHIVE_NAME"
-            echo "- Status: ${{ job.status }}"
-            if [[ -d "$RUNNER_TEMP/game" ]]; then
-              echo "- Size: $(du -sh "$RUNNER_TEMP/game" | cut -f1)"
-              echo "- Files: $(find "$RUNNER_TEMP/game" -type f | wc -l)"
-            fi
-          } >> "$GITHUB_STEP_SUMMARY"
+          GAME_FOLDER="${{ github.event.inputs.archive_name }}"
+          GAME_FOLDER="${GAME_FOLDER%.*}"
+          END_TIME=$(( $(date +%s) + 20700 ))
+          while [ $(date +%s) -lt $END_TIME ]; do
+            sleep 300
+            rclone sync "/tmp/game_root/$GAME_FOLDER/game/saves" "gdrive:Games/$GAME_FOLDER/saves" --transfers 8 || true
+          done
