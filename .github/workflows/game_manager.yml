@@ -1,10 +1,10 @@
-name: Cloud Game Stream Server (Docker WebDAV + Static Ngrok)
+name: Cloud Game Stream Server (Multi-Game WebDAV)
 
 on:
   workflow_dispatch:
     inputs:
-      archive_name:
-        description: 'Archive filename inside gdrive:Games (e.g. CampusBonds-0.5-market.zip)'
+      archive_names:
+        description: 'Comma-separated zip/rar names in gdrive:Games (e.g. CampusBonds-0.5-market.zip, Game2.zip)'
         required: true
         default: 'CampusBonds-0.5-market.zip'
 
@@ -18,7 +18,6 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y p7zip-full unrar
           curl https://rclone.org/install.sh | sudo bash
-          pip install unrpa
           curl -sSL https://ngrok-agent.s3.amazonaws.com/ngrok.asc | sudo tee /etc/apt/trusted.gpg.d/ngrok.asc >/dev/null
           echo "deb https://ngrok-agent.s3.amazonaws.com buster main" | sudo tee /etc/apt/sources.list.d/ngrok.list
           sudo apt-get update && sudo apt-get install -y ngrok
@@ -28,48 +27,53 @@ jobs:
           mkdir -p ~/.config/rclone
           echo "${{ secrets.RCLONE_CONFIG_BASE64 }}" | base64 -d > ~/.config/rclone/rclone.conf
 
-      - name: Pull, Extract & Unpack Game on GitHub NVMe SSD
+      - name: Pull & Prepare Games on GitHub Cloud SSD
         run: |
-          GAME_FOLDER="${{ github.event.inputs.archive_name }}"
-          GAME_FOLDER="${GAME_FOLDER%.*}"
-          mkdir -p raw_extract "/tmp/game_root/$GAME_FOLDER"
+          mkdir -p /tmp/game_root
+          IFS=',' read -ra ARCHIVES <<< "${{ github.event.inputs.archive_names }}"
+          for RAW_NAME in "${ARCHIVES[@]}"; do
+            ARCHIVE=$(echo "$RAW_NAME" | xargs)
+            GAME_FOLDER="${ARCHIVE%.*}"
+            mkdir -p raw_extract "/tmp/game_root/$GAME_FOLDER"
 
-          rclone copyto "gdrive:Games/${{ github.event.inputs.archive_name }}" "./${{ github.event.inputs.archive_name }}" --multi-thread-streams 8 --drive-chunk-size 128M -P
-          7z x "${{ github.event.inputs.archive_name }}" -oraw_extract -y || unrar x -y "${{ github.event.inputs.archive_name }}" raw_extract/
-          rm -f "${{ github.event.inputs.archive_name }}"
+            rclone copyto "gdrive:Games/$ARCHIVE" "./$ARCHIVE" --multi-thread-streams 8 --drive-chunk-size 128M -P
+            7z x "$ARCHIVE" -oraw_extract -y || unrar x -y "$ARCHIVE" raw_extract/
+            rm -f "$ARCHIVE"
 
-          SUBDIRS=$(find raw_extract -mindepth 1 -maxdepth 1 -type d | wc -l)
-          FILES=$(find raw_extract -mindepth 1 -maxdepth 1 -type f | wc -l)
-          if [ "$SUBDIRS" -eq 1 ] && [ "$FILES" -eq 0 ]; then
-            INNER_DIR=$(find raw_extract -mindepth 1 -maxdepth 1 -type d)
-            mv "$INNER_DIR"/* "/tmp/game_root/$GAME_FOLDER/"
-          else
-            mv raw_extract/* "/tmp/game_root/$GAME_FOLDER/"
-          fi
+            SUBDIRS=$(find raw_extract -mindepth 1 -maxdepth 1 -type d | wc -l)
+            FILES=$(find raw_extract -mindepth 1 -maxdepth 1 -type f | wc -l)
+            if [ "$SUBDIRS" -eq 1 ] && [ "$FILES" -eq 0 ]; then
+              INNER_DIR=$(find raw_extract -mindepth 1 -maxdepth 1 -type d)
+              mv "$INNER_DIR"/* "/tmp/game_root/$GAME_FOLDER/"
+            else
+              mv raw_extract/* "/tmp/game_root/$GAME_FOLDER/"
+            fi
+            rm -rf raw_extract/*
 
-          find "/tmp/game_root/$GAME_FOLDER" -name "*.rpa" | while read rpa; do
-            dir=$(dirname "$rpa")
-            unrpa -mp "$dir" "$rpa" && rm -f "$rpa"
+            # Extra Mac/Linux files hatao taaki Windows scan fast ho
+            rm -rf "/tmp/game_root/$GAME_FOLDER"/*.app "/tmp/game_root/$GAME_FOLDER"/lib/py3-linux* "/tmp/game_root/$GAME_FOLDER"/lib/py3-mac* "/tmp/game_root/$GAME_FOLDER"/*.sh
+
+            # Existing cloud saves restore karo
+            mkdir -p "/tmp/game_root/$GAME_FOLDER/game/saves"
+            rclone copy "gdrive:Games/$GAME_FOLDER/saves" "/tmp/game_root/$GAME_FOLDER/game/saves" --transfers 8 || true
           done
-
-          mkdir -p "/tmp/game_root/$GAME_FOLDER/game/saves"
-          rclone copy "gdrive:Games/$GAME_FOLDER/saves" "/tmp/game_root/$GAME_FOLDER/game/saves" --transfers 8 || true
           chmod -R 777 /tmp/game_root
 
-      - name: Start Docker WebDAV Server & Static Ngrok Tunnel
+      - name: Start High-Speed Docker WebDAV & Static Ngrok
         run: |
-          docker run -d --name game_webdav -p 8080:8080 -v /tmp/game_root:/data rclone/rclone:latest serve webdav /data --addr :8080 --vfs-cache-mode off
+          docker run -d --name game_webdav -p 8080:8080 -v /tmp/game_root:/data rclone/rclone:latest serve webdav /data --addr :8080 --dir-cache-time 24h --vfs-cache-mode minimal --buffer-size 128M
           ngrok config add-authtoken "${{ secrets.NGROK_AUTHTOKEN }}"
           ngrok http 8080 --domain="${{ secrets.NGROK_DOMAIN }}" > /dev/null &
           sleep 5
           echo "LIVE STREAM READY AT: https://${{ secrets.NGROK_DOMAIN }}"
 
-      - name: Keep Alive & Auto-Sync Saves Every 5 Minutes
+      - name: Keep Alive & Auto-Sync All Saves Every 5 Minutes
         run: |
-          GAME_FOLDER="${{ github.event.inputs.archive_name }}"
-          GAME_FOLDER="${GAME_FOLDER%.*}"
           END_TIME=$(( $(date +%s) + 20700 ))
           while [ $(date +%s) -lt $END_TIME ]; do
             sleep 300
-            rclone sync "/tmp/game_root/$GAME_FOLDER/game/saves" "gdrive:Games/$GAME_FOLDER/saves" --transfers 8 || true
+            for DIR in /tmp/game_root/*/; do
+              GAME_FOLDER=$(basename "$DIR")
+              rclone sync "/tmp/game_root/$GAME_FOLDER/game/saves" "gdrive:Games/$GAME_FOLDER/saves" --transfers 8 || true
+            done
           done
