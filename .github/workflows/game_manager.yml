@@ -38,8 +38,11 @@ jobs:
           rm -f "renpy-${RENPY_VER}-sdk.tar.bz2"
 
           wget -q "https://www.renpy.org/dl/${RENPY_VER}/renpy-${RENPY_VER}-web.zip"
-          unzip -q "renpy-${RENPY_VER}-web.zip" -d renpy_sdk/web/
-          rm -f "renpy-${RENPY_VER}-web.zip"
+          unzip -q "renpy-${RENPY_VER}-web.zip" -d temp_web/
+          mkdir -p renpy_sdk/web
+          WEB_INNER=$(dirname "$(find temp_web -name "index.html" | head -n 1)")
+          cp -r "$WEB_INNER"/* renpy_sdk/web/
+          rm -rf temp_web "renpy-${RENPY_VER}-web.zip"
 
       - name: Configure Rclone
         run: |
@@ -95,7 +98,7 @@ jobs:
               for root, _, files in os.walk(prog_dir):
                   for fname in sorted(files):
                       full_path = os.path.join(root, fname)
-                      rel_path = os.path.relpath(full_path, "web_out")  # e.g. game/images/bg1.png
+                      rel_path = os.path.relpath(full_path, "web_out")
                       size = os.path.getsize(full_path)
                       heavy_files.append((full_path, rel_path, size))
 
@@ -174,7 +177,7 @@ jobs:
             const BASE_URL = __BASE_URL__;
             const MANIFEST = __MANIFEST__;
             const ALL_CHUNKS = __CHUNKS__;
-            const MAX_BUFFER_BYTES = 1024 * 1024 * 1024; // 1 GB Rolling FIFO Buffer
+            const MAX_BUFFER_BYTES = 1024 * 1024 * 1024;
 
             const fifoCache = new Map();
             const inflightChunks = new Map();
@@ -223,7 +226,6 @@ jobs:
                 currentBufferBytes += totalSize;
                 inflightChunks.delete(chunkName);
 
-                // Background lookahead preload of next 2 chunks (~360 MB) for zero-lag Skip
                 const idx = ALL_CHUNKS.indexOf(chunkName);
                 if (idx !== -1) {
                   for (let next = idx + 1; next <= idx + 2 && next < ALL_CHUNKS.length; next++) {
