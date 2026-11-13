@@ -53,7 +53,9 @@ jobs:
             mv raw_extract/* game_src/
           fi
 
-          cp -r web_runtime/web/* web_out/
+          # Ren'Py Web runtime files copy karo
+          cp -r web_runtime/* web_out/
+          rm -rf web_out/web
 
           cd game_src
           zip -0 -r ../web_out/game.zip game/
