@@ -4,7 +4,7 @@
 <head>
 <script>
 (function() {
-  const PART_URLS = ["https://github.com/hola41242/data_sync/releases/download/game-campusbonds/game.zip.part00", "https://github.com/hola41242/data_sync/releases/download/game-campusbonds/game.zip.part01", "https://github.com/hola41242/data_sync/releases/download/game-campusbonds/game.zip.part02", "https://github.com/hola41242/data_sync/releases/download/game-campusbonds/game.zip.part03"];
+  const PART_URLS = ["https://gh-cors-proxy.shubhamyadav39275000.workers.dev/?url=https://github.com/hola41242/data_sync/releases/download/game-campusbonds/game.zip.part00", "https://gh-cors-proxy.shubhamyadav39275000.workers.dev/?url=https://github.com/hola41242/data_sync/releases/download/game-campusbonds/game.zip.part01", "https://gh-cors-proxy.shubhamyadav39275000.workers.dev/?url=https://github.com/hola41242/data_sync/releases/download/game-campusbonds/game.zip.part02", "https://gh-cors-proxy.shubhamyadav39275000.workers.dev/?url=https://github.com/hola41242/data_sync/releases/download/game-campusbonds/game.zip.part03"];
   const origFetch = window.fetch;
   window.fetch = async function(resource, init) {
     const url = (typeof resource === 'string') ? resource : (resource && resource.url) || '';
