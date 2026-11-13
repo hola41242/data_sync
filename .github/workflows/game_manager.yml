@@ -4,13 +4,13 @@ on:
   workflow_dispatch:
     inputs:
       archive_name:
-        description: 'Archive filename inside gdrive:Games (e.g. CampusBonds-0.5-market.zip)'
+        description: 'Archive filename inside gdrive:Games (e.g. Bonds-0.5-market.zip)'
         required: true
-        default: 'CampusBonds-0.5-market.zip'
+        default: 'Bonds-0.5-market.zip'
       game_slug:
         description: 'Clean URL folder name (lowercase, no spaces, e.g. bonds)'
         required: true
-        default: 'campusbonds'
+        default: 'bonds'
 
 permissions:
   contents: write
@@ -22,28 +22,24 @@ jobs:
       - name: Checkout Repo
         uses: actions/checkout@v4
 
-      - name: Install Tools & Official Ren'Py SDK + Web Support
+      - name: Install Tools & Official Ren'Py Web Runtime
         run: |
           sudo apt-get update
-          sudo apt-get install -y p7zip-full unrar wget
+          sudo apt-get install -y p7zip-full unrar wget zip
           curl https://rclone.org/install.sh | sudo bash
 
           RENPY_VER="8.3.4"
-          wget -q "https://www.renpy.org/dl/${RENPY_VER}/renpy-${RENPY_VER}-sdk.tar.bz2"
-          tar -xf "renpy-${RENPY_VER}-sdk.tar.bz2"
-          mv "renpy-${RENPY_VER}-sdk" renpy_sdk
-
           wget -q "https://www.renpy.org/dl/${RENPY_VER}/renpy-${RENPY_VER}-web.zip"
-          unzip -q "renpy-${RENPY_VER}-web.zip" -d renpy_sdk/
+          unzip -q "renpy-${RENPY_VER}-web.zip" -d web_runtime/
 
       - name: Configure Rclone
         run: |
           mkdir -p ~/.config/rclone
           echo "${{ secrets.RCLONE_CONFIG_BASE64 }}" | base64 -d > ~/.config/rclone/rclone.conf
 
-      - name: Pull & Extract Game (100% Original Lossless Assets)
+      - name: Pull & Package Lossless Game (Zero Re-encoding)
         run: |
-          mkdir -p raw_extract game_src
+          mkdir -p raw_extract game_src web_out
           rclone copyto "gdrive:Games/${{ github.event.inputs.archive_name }}" "./${{ github.event.inputs.archive_name }}" --multi-thread-streams 8 --drive-chunk-size 128M -P
           7z x "${{ github.event.inputs.archive_name }}" -oraw_extract -y || unrar x -y "${{ github.event.inputs.archive_name }}" raw_extract/
           rm -f "${{ github.event.inputs.archive_name }}"
@@ -57,13 +53,14 @@ jobs:
             mv raw_extract/* game_src/
           fi
 
-          # Mac/Linux extra binaries hatao (game assets untouched)
-          rm -rf game_src/*.app game_src/lib/py3-linux* game_src/lib/py3-mac* game_src/*.sh
+          # Ren'Py Web runtime files copy karo
+          cp -r web_runtime/web/* web_out/
 
-      - name: Build Lossless Progressive Web Package
-        run: |
-          mkdir -p web_out
-          ./renpy_sdk/renpy.sh ./renpy_sdk/launcher web_build ./game_src --destination ./web_out
+          # Game ke original 'game/' folder ko 0% compression (-0) ke saath game.zip banao
+          cd game_src
+          zip -0 -r ../web_out/game.zip game/
+          cd ..
+          rm -rf raw_extract game_src
 
       - name: Upload Heavy Assets to GitHub Releases CDN (Bypass 1GB Pages Limit)
         env:
@@ -72,21 +69,19 @@ jobs:
           SLUG="${{ github.event.inputs.game_slug }}"
           TAG="game-${SLUG}"
 
-          # Agar purana release ho toh delete karke fresh upload karo
           gh release delete "$TAG" --yes --cleanup-tag || true
           gh release create "$TAG" --title "Game Stream: $SLUG" --notes "Lossless assets for $SLUG"
 
-          # Agar game.zip 1.9 GB se bada hai toh 1.9 GB chunks mein split karo (0% compression)
-          if [ -f "web_out/game.zip" ]; then
-            SIZE=$(stat -c%s "web_out/game.zip")
-            if [ "$SIZE" -gt 1900000000 ]; then
-              split -b 1900M -d "web_out/game.zip" "web_out/game.zip.part"
-              rm -f "web_out/game.zip"
-              gh release upload "$TAG" web_out/game.zip.part*
-            else
-              gh release upload "$TAG" "web_out/game.zip"
-              rm -f "web_out/game.zip"
-            fi
+          SIZE=$(stat -c%s "web_out/game.zip")
+          echo "Packaged game.zip size: $SIZE bytes"
+
+          if [ "$SIZE" -gt 1900000000 ]; then
+            split -b 1900M -d "web_out/game.zip" "web_out/game.zip.part"
+            rm -f "web_out/game.zip"
+            gh release upload "$TAG" web_out/game.zip.part*
+          else
+            gh release upload "$TAG" "web_out/game.zip"
+            rm -f "web_out/game.zip"
           fi
 
       - name: Deploy Lightweight Loader to GitHub Pages (24/7 Live)
