@@ -25,7 +25,7 @@ jobs:
       - name: Install Tools & Official Ren'Py Web Runtime
         run: |
           sudo apt-get update
-          sudo apt-get install -y p7zip-full unrar wget zip
+          sudo apt-get install -y p7zip-full unrar wget zip python3
           curl https://rclone.org/install.sh | sudo bash
 
           RENPY_VER="8.3.4"
@@ -53,36 +53,78 @@ jobs:
             mv raw_extract/* game_src/
           fi
 
-          # Ren'Py Web runtime files copy karo
           cp -r web_runtime/web/* web_out/
 
-          # Game ke original 'game/' folder ko 0% compression (-0) ke saath game.zip banao
           cd game_src
           zip -0 -r ../web_out/game.zip game/
           cd ..
           rm -rf raw_extract game_src
 
-      - name: Upload Heavy Assets to GitHub Releases CDN (Bypass 1GB Pages Limit)
+      - name: Upload Heavy Assets to GitHub Releases & Clean web_out
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           SLUG="${{ github.event.inputs.game_slug }}"
           TAG="game-${SLUG}"
+          REPO="${{ github.repository }}"
 
           gh release delete "$TAG" --yes --cleanup-tag || true
           gh release create "$TAG" --title "Game Stream: $SLUG" --notes "Lossless assets for $SLUG"
 
           SIZE=$(stat -c%s "web_out/game.zip")
-          echo "Packaged game.zip size: $SIZE bytes"
-
           if [ "$SIZE" -gt 1900000000 ]; then
             split -b 1900M -d "web_out/game.zip" "web_out/game.zip.part"
             rm -f "web_out/game.zip"
+            PARTS=$(ls web_out/game.zip.part* | xargs -n1 basename)
             gh release upload "$TAG" web_out/game.zip.part*
+            rm -f web_out/game.zip.part*
           else
+            PARTS="game.zip"
             gh release upload "$TAG" "web_out/game.zip"
             rm -f "web_out/game.zip"
           fi
+
+          # index.html mein CDN stream loader inject karo taaki browser Release se game.zip load kare
+          python3 - <<EOF
+          import json
+          parts = """$PARTS""".strip().split()
+          urls = [f"https://github.com/$REPO/releases/download/$TAG/{p}" for p in parts]
+          hook = f"""
+          <script>
+          (function() {{
+            const PART_URLS = {json.dumps(urls)};
+            const origFetch = window.fetch;
+            window.fetch = async function(resource, init) {{
+              const url = (typeof resource === 'string') ? resource : (resource && resource.url) || '';
+              if (url.endsWith('game.zip')) {{
+                const responses = await Promise.all(PART_URLS.map(u => origFetch(u)));
+                const streams = responses.map(r => r.body);
+                const combined = new ReadableStream({{
+                  async start(controller) {{
+                    for (const s of streams) {{
+                      const reader = s.getReader();
+                      while (true) {{
+                        const {{ done, value }} = await reader.read();
+                        if (done) break;
+                        controller.enqueue(value);
+                      }}
+                    }}
+                    controller.close();
+                  }}
+                }});
+                return new Response(combined, {{ headers: {{ 'Content-Type': 'application/zip' }} }});
+              }}
+              return origFetch.apply(this, arguments);
+            }};
+          }})();
+          </script>
+          """
+          with open("web_out/index.html", "r", encoding="utf-8") as f:
+            html = f.read()
+          html = html.replace("<head>", "<head>" + hook, 1)
+          with open("web_out/index.html", "w", encoding="utf-8") as f:
+            f.write(html)
+          EOF
 
       - name: Deploy Lightweight Loader to GitHub Pages (24/7 Live)
         uses: peaceiris/actions-gh-pages@v4
