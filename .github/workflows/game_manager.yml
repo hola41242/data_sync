@@ -4,11 +4,11 @@ on:
   workflow_dispatch:
     inputs:
       archive_name:
-        description: 'Archive filename inside gdrive:Games (e.g. CampusBonds-0.5-market.zip)'
+        description: 'Archive filename inside gdrive:Games (e.g. Bonds-0.5-market.zip)'
         required: true
         default: 'CampusBonds-0.5-market.zip'
       game_slug:
-        description: 'Clean URL folder name (lowercase, no spaces, e.g. bonds)'
+        description: 'Clean URL folder name (lowercase, no spaces, e.g. campusbonds)'
         required: true
         default: 'campusbonds'
 
@@ -53,9 +53,9 @@ jobs:
             mv raw_extract/* game_src/
           fi
 
-          # Ren'Py Web runtime files copy karo
-          cp -r web_runtime/* web_out/
-          rm -rf web_out/web
+          # index.html jis bhi subfolder mein ho, us poore folder ko web_out/ mein copy karo
+          RUNTIME_DIR=$(dirname "$(find web_runtime -name "index.html" | head -n 1)")
+          cp -r "$RUNTIME_DIR"/* web_out/
 
           cd game_src
           zip -0 -r ../web_out/game.zip game/
@@ -86,7 +86,6 @@ jobs:
             rm -f "web_out/game.zip"
           fi
 
-          # index.html mein CDN stream loader inject karo taaki browser Release se game.zip load kare
           python3 - <<EOF
           import json
           parts = """$PARTS""".strip().split()
