@@ -71,6 +71,7 @@ jobs:
           chunks_dir = "chunks_out"
           MAX_CHUNK_BYTES = 180 * 1024 * 1024
 
+          # ONLY pure code/fonts/config in game.zip (keeps it ~10-20 MB, well under GitHub's 100 MB limit)
           BOOT_EXTS = {'.rpy', '.rpyc', '.rpym', '.rpymc', '.rpyb', '.ttf', '.otf', '.txt', '.json'}
           boot_files = []
           heavy_files = []
@@ -81,7 +82,7 @@ jobs:
                   rel_path = os.path.relpath(full_path, "game_src")
                   ext = os.path.splitext(fname)[1].lower()
                   size = os.path.getsize(full_path)
-                  if ext in BOOT_EXTS or size < 150 * 1024:
+                  if ext in BOOT_EXTS:
                       boot_files.append((full_path, rel_path))
                   else:
                       heavy_files.append((full_path, rel_path, size))
