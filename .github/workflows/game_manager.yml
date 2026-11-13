@@ -4,13 +4,13 @@ on:
   workflow_dispatch:
     inputs:
       archive_name:
-        description: 'Archive filename inside gdrive:Games (e.g. Bonds-0.5-market.zip)'
+        description: 'Archive filename inside gdrive:Games (e.g. CampusBonds-0.5-market.zip)'
         required: true
-        default: 'Bonds-0.5-market.zip'
+        default: 'CampusBonds-0.5-market.zip'
       game_slug:
         description: 'Clean URL folder name (lowercase, no spaces, e.g. bonds)'
         required: true
-        default: 'bonds'
+        default: 'campusbonds'
 
 permissions:
   contents: write
