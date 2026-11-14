@@ -64,13 +64,11 @@ jobs:
             mv raw_extract/* game_src/
           fi
 
-          # Unpack all .rpa archives losslessly
           find game_src/game -name "*.rpa" | sort | while read -r rpa; do
             python3 /usr/local/bin/rpatool -x "$rpa" -o game_src/game/
             rm -f "$rpa"
           done
 
-          # Keep scripts, fonts, AND small .webm/.mp4 videos (<50MB) in direct web_out so HTML5 <video> plays natively with 0 errors
           cat << 'PROGTXT' > game_src/game/progressive_download.txt
           - game/**.rpy
           - game/**.rpyc
@@ -83,7 +81,7 @@ jobs:
           ./renpy_sdk/renpy.sh ./renpy_sdk/launcher web_build game_src --destination web_out
 
           cat << 'PYSCRIPT' > pack_chunks.py
-          import os, zipfile, json
+          import os, zipfile, json, shutil
 
           prog_dir = "web_out/game"
           chunks_dir = "chunks_out"
@@ -96,14 +94,11 @@ jobs:
                       full_path = os.path.join(root, fname)
                       rel_path = os.path.relpath(full_path, "web_out").replace("\\", "/")
                       size = os.path.getsize(full_path)
-                      # Leave .webm/.mp4 videos (<90MB) directly in web_out/game/ so <video> tag loads them natively without XHR
-                      if fname.lower().endswith(('.webm', '.mp4', '.ogv')) and size < 90 * 1024 * 1024:
-                          continue
                       heavy_files.append((full_path, rel_path, size))
 
           def priority_key(item):
               p = item[1].lower()
-              if any(k in p for k in ['/gui/', 'splash', 'menu', 'logo', 'black', 'idle', 'hover', '.ogg', '.mp3']):
+              if any(k in p for k in ['/gui/', 'splash', 'menu', 'logo', 'black', 'idle', 'hover', '.ogg', '.mp3', '_anim.webm']):
                   return (0, p)
               return (1, p)
 
@@ -131,15 +126,11 @@ jobs:
                   cur_zip.write(full_path, rel_path)
                   manifest[rel_path] = cur_name
                   cur_size += size
-                  os.remove(full_path)
               cur_zip.close()
 
-          # Clean empty directories inside web_out/game
-          for root, dirs, _ in os.walk(prog_dir, topdown=False):
-              for d in dirs:
-                  dp = os.path.join(root, d)
-                  if not os.listdir(dp):
-                      os.rmdir(dp)
+          # Remove entire web_out/game so gh-pages push stays tiny (~75MB) and never hits HTTP 500
+          if os.path.exists(prog_dir):
+              shutil.rmtree(prog_dir)
 
           with open("web_out/stream_manifest.json", "w", encoding="utf-8") as f:
               json.dump(manifest, f)
@@ -150,7 +141,7 @@ jobs:
           python3 pack_chunks.py
           rm -rf raw_extract game_src renpy_sdk pack_chunks.py
 
-      - name: Upload Chunks & Inject Clean Prototype XHR + Fetch 1GB Auto-Evict Buffer
+      - name: Upload Chunks & Inject Fetch + Prototype XHR + HTML5 Video Blob Hook
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           GAME_SLUG: ${{ github.event.inputs.game_slug }}
@@ -191,7 +182,7 @@ jobs:
             const BASE_URL = __BASE_URL__;
             const MANIFEST = __MANIFEST__;
             const ALL_CHUNKS = __CHUNKS__;
-            const MAX_BUFFER_BYTES = 900 * 1024 * 1024; // ~900 MB Rolling FIFO Buffer (strictly under 1GB)
+            const MAX_BUFFER_BYTES = 900 * 1024 * 1024;
 
             const SUFFIX_MAP = new Map();
             for (const [k, chunk] of Object.entries(MANIFEST)) {
@@ -216,7 +207,6 @@ jobs:
             const inflightChunks = new Map();
             let currentBufferBytes = 0;
 
-            // Strictly evict oldest played chunks and clear memory references
             function evictIfNeeded(neededBytes) {
               while (currentBufferBytes + neededBytes > MAX_BUFFER_BYTES && fifoCache.size > 0) {
                 let oldestKey = null;
@@ -264,7 +254,6 @@ jobs:
                 currentBufferBytes += totalSize;
                 inflightChunks.delete(chunkName);
 
-                // Preload next 2 chunks (~360 MB) ahead
                 const idx = ALL_CHUNKS.indexOf(chunkName);
                 if (idx !== -1) {
                   for (let next = idx + 1; next <= idx + 2 && next < ALL_CHUNKS.length; next++) {
@@ -299,7 +288,7 @@ jobs:
               return origFetch(resource, init);
             };
 
-            // 2. Prototype-level XHR hook (never breaks game.zip or renpy.wasm native XHR!)
+            // 2. Prototype-level XHR hook
             const origOpen = XMLHttpRequest.prototype.open;
             const origSend = XMLHttpRequest.prototype.send;
 
@@ -344,6 +333,30 @@ jobs:
                 xhr.dispatchEvent(new Event('readystatechange'));
                 xhr.dispatchEvent(new Event('error'));
               });
+            };
+
+            // 3. HTML5 <video> / <source> Blob hook (serves .webm/.mp4 from chunk buffer with 0 GitHub Pages bloat)
+            const origSetAttr = Element.prototype.setAttribute;
+            Element.prototype.setAttribute = function(name, value) {
+              if (name.toLowerCase() === 'src' && (this.tagName === 'VIDEO' || this.tagName === 'SOURCE')) {
+                const info = resolveAsset(value);
+                if (info) {
+                  const el = this;
+                  getAssetBytes(info).then(bytes => {
+                    if (bytes) {
+                      const blobUrl = URL.createObjectURL(new Blob([bytes], { type: 'video/webm' }));
+                      origSetAttr.call(el, 'src', blobUrl);
+                      if (el.tagName === 'SOURCE' && el.parentElement && el.parentElement.load) {
+                        el.parentElement.load();
+                      } else if (el.load) {
+                        el.load();
+                      }
+                    }
+                  });
+                  return;
+                }
+              }
+              return origSetAttr.apply(this, arguments);
             };
           })();
           </script>
