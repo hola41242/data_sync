@@ -1,12 +1,12 @@
-name: Universal RenPy Lossless Web Streamer (Drive List + Multi-Build)
+name: Universal RenPy Lossless Web Streamer (Telegram + Auto-Clean)
 
 on:
   workflow_dispatch:
     inputs:
       target_archive:
-        description: 'Enter "LIST" to print Drive games, "ALL" for new games, or comma-separated filenames'
+        description: 'Enter "LIST", "STATUS", "ALL", "DELETE: slug", or comma-separated filenames'
         required: true
-        default: 'CampusBonds-0.5-market.zip'
+        default: 'STATUS'
 
 permissions:
   contents: write
@@ -24,20 +24,129 @@ jobs:
           mkdir -p ~/.config/rclone
           echo "${{ secrets.RCLONE_CONFIG_BASE64 }}" | base64 -d > ~/.config/rclone/rclone.conf
 
-      - name: List Games in Google Drive (If target_archive == LIST)
+      - name: List Games in Google Drive (LIST)
         if: ${{ github.event.inputs.target_archive == 'LIST' || github.event.inputs.target_archive == 'list' }}
+        env:
+          TG_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TG_CHAT: ${{ secrets.TELEGRAM_CHAT_ID }}
         run: |
-          echo "========================================================"
-          echo "AVAILABLE ARCHIVES IN gdrive:Games:"
-          echo "========================================================"
-          rclone lsf gdrive:Games --files-only | grep -iE '\.(zip|rar|7z)$' | sort
-          echo ""
-          echo "COPY-PASTE READY (ALL COMMA-SEPARATED):"
-          rclone lsf gdrive:Games --files-only | grep -iE '\.(zip|rar|7z)$' | sort | paste -sd ", " -
-          echo "========================================================"
+          export LIST_OUT=$(rclone lsf gdrive:Games --files-only | grep -iE '\.(zip|rar|7z)$' | sort)
+          export COMMA_OUT=$(echo "$LIST_OUT" | paste -sd ", " -)
+          echo "AVAILABLE ARCHIVES:"
+          echo "$LIST_OUT"
+          echo "COMMA-SEPARATED: $COMMA_OUT"
+
+          if [ -n "$TG_TOKEN" ] && [ -n "$TG_CHAT" ]; then
+            python3 - << 'TGPY'
+          import os, urllib.request, json
+          list_out = os.environ.get("LIST_OUT", "").strip()
+          comma_out = os.environ.get("COMMA_OUT", "").strip()
+          msg = "📂 *Google Drive (`gdrive:Games`):*\n\n" + (f"```\n{list_out}\n```\n\n📋 *Copy-Paste Build Command:*\n`/build {comma_out}`" if list_out else "_No archives found._")
+          req = urllib.request.Request(
+              f"https://api.telegram.org/bot{os.environ['TG_TOKEN']}/sendMessage",
+              data=json.dumps({"chat_id": os.environ["TG_CHAT"], "text": msg[:4000], "parse_mode": "Markdown"}).encode(),
+              headers={"Content-Type": "application/json"}
+          )
+          urllib.request.urlopen(req)
+          TGPY
+          fi
+
+      - name: Check Storage & Ready Builds (STATUS)
+        if: ${{ github.event.inputs.target_archive == 'STATUS' || github.event.inputs.target_archive == 'status' }}
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REPO_NAME: ${{ github.repository }}
+          TG_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TG_CHAT: ${{ secrets.TELEGRAM_CHAT_ID }}
+        run: |
+          mkdir -p site_root
+          cd site_root
+          git init
+          git remote add origin "https://x-access-token:${GH_TOKEN}@github.com/${REPO_NAME}.git"
+          if git ls-remote --exit-code --heads origin gh-pages >/dev/null 2>&1; then
+            git fetch origin gh-pages
+            git checkout -b gh-pages origin/gh-pages
+          fi
+
+          python3 - << 'STATPY'
+          import os, urllib.request, json
+
+          def dir_size(path):
+              total = 0
+              for r, _, files in os.walk(path):
+                  for f in files:
+                      total += os.path.getsize(os.path.join(r, f))
+              return total
+
+          games = sorted([d for d in os.listdir('.') if os.path.isdir(d) and not d.startswith('.') and os.path.exists(os.path.join(d, 'index.html'))])
+          lines = []
+          total_bytes = 0
+          for g in games:
+              sz = dir_size(g)
+              total_bytes += sz
+              lines.append(f"• `{g}` ({round(sz/1048576, 1)} MB) → https://hola41242.github.io/data_sync/{g}/")
+
+          used_mb = round(total_bytes / 1048576, 1)
+          free_mb = round(max(0, 850 - used_mb), 1)
+          body = "\n".join(lines) if lines else "_No live games deployed yet._"
+          msg = f"📊 *GitHub Pages Quota:* `{used_mb} MB / 850 MB` (`{free_mb} MB` free)\n\n🎮 *Ready Builds ({len(games)}):*\n{body}"
+          print(msg)
+
+          if os.environ.get("TG_TOKEN") and os.environ.get("TG_CHAT"):
+              req = urllib.request.Request(
+                  f"https://api.telegram.org/bot{os.environ['TG_TOKEN']}/sendMessage",
+                  data=json.dumps({"chat_id": os.environ["TG_CHAT"], "text": msg[:4000], "parse_mode": "Markdown", "disable_web_page_preview": True}).encode(),
+                  headers={"Content-Type": "application/json"}
+              )
+              urllib.request.urlopen(req)
+          STATPY
+
+      - name: Delete Specific Games (DELETE)
+        if: ${{ startsWith(github.event.inputs.target_archive, 'DELETE:') || startsWith(github.event.inputs.target_archive, 'delete:') }}
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REPO_NAME: ${{ github.repository }}
+          TARGET: ${{ github.event.inputs.target_archive }}
+          TG_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TG_CHAT: ${{ secrets.TELEGRAM_CHAT_ID }}
+        run: |
+          mkdir -p site_root
+          cd site_root
+          git init
+          git remote add origin "https://x-access-token:${GH_TOKEN}@github.com/${REPO_NAME}.git"
+          git fetch origin gh-pages
+          git checkout -b gh-pages origin/gh-pages
+
+          SLUGS=$(echo "$TARGET" | sed -E 's/^[Dd][Ee][Ll][Ee][Tt][Ee]:[[:space:]]*//' | tr ',' '\n' | sed 's/^[[:space:]]*//;s/[[:space:]]*$//' | tr '[:upper:]' '[:lower:]')
+          echo "$SLUGS" | while IFS= read -r S; do
+            [ -z "$S" ] && continue
+            echo "Deleting game: $S"
+            rm -rf "$S"
+            gh release delete "game-$S" --yes --cleanup-tag || true
+          done
+
+          python3 - << 'INDEXPY'
+          import os
+          games = sorted([d for d in os.listdir('.') if os.path.isdir(d) and not d.startswith('.') and os.path.exists(os.path.join(d, 'index.html'))])
+          cards = "\n".join([f'<a href="./{g}/" style="display:block;padding:18px;margin:10px;background:#1e1e2e;color:#fff;text-decoration:none;border-radius:10px;font:600 18px sans-serif;border:1px solid #313244;">▶ {g.upper()} <span style="float:right;color:#a6e3a1;font-size:13px;">/{g}/</span></a>' for g in games])
+          with open("index.html", "w", encoding="utf-8") as f:
+              f.write(f'<!DOCTYPE html><html><head><meta charset="utf-8"><title>Game Stream Library</title></head><body style="background:#11111b;color:#cdd6f4;font-family:sans-serif;max-width:700px;margin:40px auto;padding:20px;"><h1>🎮 Cloud Ren\'Py Library</h1>{cards}</body></html>')
+          INDEXPY
+
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add -A
+          git commit -m "Delete selected games" || echo "Nothing to commit"
+          git push origin gh-pages
+
+          if [ -n "$TG_TOKEN" ] && [ -n "$TG_CHAT" ]; then
+            curl -s -X POST "https://api.telegram.org/bot${TG_TOKEN}/sendMessage" \
+              -H "Content-Type: application/json" \
+              -d "{\"chat_id\":\"${TG_CHAT}\",\"text\":\"🗑️ Removed requested game(s) & freed storage! Send /status to verify.\"}" >/dev/null
+          fi
 
       - name: Install Tools, rpatool & Official Ren'Py SDK
-        if: ${{ github.event.inputs.target_archive != 'LIST' && github.event.inputs.target_archive != 'list' }}
+        if: ${{ github.event.inputs.target_archive != 'LIST' && github.event.inputs.target_archive != 'list' && github.event.inputs.target_archive != 'STATUS' && github.event.inputs.target_archive != 'status' && !startsWith(github.event.inputs.target_archive, 'DELETE:') && !startsWith(github.event.inputs.target_archive, 'delete:') }}
         run: |
           sudo apt-get update
           sudo apt-get install -y p7zip-full unrar wget zip unzip python3 tar bzip2
@@ -58,11 +167,13 @@ jobs:
           rm -rf temp_web "renpy-${RENPY_VER}-web.zip"
 
       - name: Build Selected Games into 45MB Natural-Ordered Chunks & Deploy
-        if: ${{ github.event.inputs.target_archive != 'LIST' && github.event.inputs.target_archive != 'list' }}
+        if: ${{ github.event.inputs.target_archive != 'LIST' && github.event.inputs.target_archive != 'list' && github.event.inputs.target_archive != 'STATUS' && github.event.inputs.target_archive != 'status' && !startsWith(github.event.inputs.target_archive, 'DELETE:') && !startsWith(github.event.inputs.target_archive, 'delete:') }}
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           REPO_NAME: ${{ github.repository }}
           TARGET: ${{ github.event.inputs.target_archive }}
+          TG_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TG_CHAT: ${{ secrets.TELEGRAM_CHAT_ID }}
         run: |
           mkdir -p site_root
           cd site_root
@@ -147,13 +258,10 @@ jobs:
 
           def priority_key(item):
               p = item[1].lower()
-              # Tier 0: GUI, menus, buttons, audio, intro animations
               if any(k in p for k in ['/gui/', 'splash', 'menu', 'logo', 'black', 'idle', 'hover', '.ogg', '.mp3', '_anim.webm']):
                   return (0, natural_tokens(p))
-              # Tier 1: Episode 1 / Chapter 1 / Prologue / Intro scenes
               if re.search(r'(ep|episode|ch|chapter|part|day|act)[-_ ]?0*1\b|prologue|intro', p):
                   return (1, natural_tokens(p))
-              # Tier 2: Remaining episodes in natural numeric order (ep2, ep3... scene1, scene2...)
               return (2, natural_tokens(p))
 
           heavy_files.sort(key=priority_key)
@@ -310,8 +418,6 @@ jobs:
                 return entry;
               }
               if (inflightChunks.has(chunkName)) return inflightChunks.get(chunkName);
-
-              // Do not start background preload if an urgent scene chunk is downloading (prevents Wi-Fi bandwidth choke)
               if (!isUrgent && activeUrgentCount > 0) return null;
 
               if (isUrgent) activeUrgentCount++;
@@ -340,7 +446,6 @@ jobs:
                   if (isUrgent) activeUrgentCount = Math.max(0, activeUrgentCount - 1);
                   inflightChunks.delete(chunkName);
 
-                  // Preload only 2 next chunks sequentially so Wi-Fi stays fast & responsive
                   if (preloadAhead > 0) {
                     const idx = ALL_CHUNKS.indexOf(chunkName);
                     if (idx !== -1) {
@@ -490,10 +595,45 @@ jobs:
             CUR_SLUG="$SLUG" python3 inject_loader.py
             rm -rf "site_root/$SLUG"
             mv web_out "site_root/$SLUG"
+            date +%s > "site_root/$SLUG/.built_ts"
             rm -rf raw_extract game_src chunks_out pack_chunks.py inject_loader.py
           done
 
           cd site_root
+          python3 - << 'EVICTPY'
+          import os, shutil, subprocess
+
+          MAX_BYTES = 850 * 1024 * 1024
+
+          def dir_size(path):
+              total = 0
+              for r, _, files in os.walk(path):
+                  for f in files:
+                      total += os.path.getsize(os.path.join(r, f))
+              return total
+
+          def built_time(d):
+              ts_file = os.path.join(d, '.built_ts')
+              if os.path.exists(ts_file):
+                  try:
+                      return int(open(ts_file).read().strip())
+                  except ValueError:
+                      pass
+              return 0
+
+          games = [d for d in os.listdir('.') if os.path.isdir(d) and not d.startswith('.') and os.path.exists(os.path.join(d, 'index.html'))]
+          games.sort(key=built_time)
+
+          total = sum(dir_size(g) for g in games)
+          while total > MAX_BYTES and len(games) > 1:
+              oldest = games.pop(0)
+              sz = dir_size(oldest)
+              print(f"Auto-evicting oldest game: {oldest}")
+              shutil.rmtree(oldest)
+              subprocess.run(["gh", "release", "delete", f"game-{oldest}", "--yes", "--cleanup-tag"], check=False)
+              total -= sz
+          EVICTPY
+
           python3 - << 'INDEXPY'
           import os
           games = sorted([d for d in os.listdir('.') if os.path.isdir(d) and not d.startswith('.') and os.path.exists(os.path.join(d, 'index.html'))])
@@ -507,3 +647,9 @@ jobs:
           git add -A
           git commit -m "Deploy games" || echo "Nothing new to commit"
           git push origin gh-pages
+
+          if [ -n "$TG_TOKEN" ] && [ -n "$TG_CHAT" ]; then
+            curl -s -X POST "https://api.telegram.org/bot${TG_TOKEN}/sendMessage" \
+              -H "Content-Type: application/json" \
+              -d "{\"chat_id\":\"${TG_CHAT}\",\"text\":\"✅ Build & Deploy Complete! Send /status to view ready game links & storage.\"}" >/dev/null
+          fi
