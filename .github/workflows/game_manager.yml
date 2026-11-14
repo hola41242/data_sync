@@ -175,6 +175,13 @@ jobs:
           TG_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TG_CHAT: ${{ secrets.TELEGRAM_CHAT_ID }}
         run: |
+          notify_tg() {
+            local MSG="$1"
+            if [ -n "$TG_TOKEN" ] && [ -n "$TG_CHAT" ]; then
+              python3 -c 'import os, sys, urllib.request, json; urllib.request.urlopen(urllib.request.Request(f"https://api.telegram.org/bot{os.environ[\"TG_TOKEN\"]}/sendMessage", data=json.dumps({"chat_id": os.environ["TG_CHAT"], "text": sys.argv[1]}).encode(), headers={"Content-Type": "application/json"}))' "$MSG" || true
+            fi
+          }
+
           mkdir -p site_root
           cd site_root
           git init
@@ -185,6 +192,8 @@ jobs:
           else
             git checkout -b gh-pages
           fi
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
           cd ..
 
           if [ "$TARGET" = "ALL" ]; then
@@ -208,21 +217,35 @@ jobs:
             rm -rf raw_extract game_src web_out chunks_out
             mkdir -p raw_extract game_src web_out chunks_out
 
-            rclone copyto "gdrive:Games/${ARCHIVE}" "./${ARCHIVE}" --multi-thread-streams 8 --drive-chunk-size 128M -P
-            7z x "${ARCHIVE}" -oraw_extract -y || unrar x -y "${ARCHIVE}" raw_extract/
-            rm -f "${ARCHIVE}"
-
-            SUBDIRS=$(find raw_extract -mindepth 1 -maxdepth 1 -type d | wc -l)
-            FCOUNT=$(find raw_extract -mindepth 1 -maxdepth 1 -type f | wc -l)
-            if [ "$SUBDIRS" -eq 1 ] && [ "$FCOUNT" -eq 0 ]; then
-              INNER_DIR=$(find raw_extract -mindepth 1 -maxdepth 1 -type d)
-              mv "$INNER_DIR"/* game_src/
-            else
-              mv raw_extract/* game_src/
+            if ! rclone copyto "gdrive:Games/${ARCHIVE}" "./${ARCHIVE}" --multi-thread-streams 8 --drive-chunk-size 128M -P; then
+              echo "⚠️ Failed to download $ARCHIVE"
+              notify_tg "⚠️ Failed & Skipped: $ARCHIVE (Google Drive download error)"
+              rm -f "${ARCHIVE}"
+              continue
             fi
 
+            if ! (7z x "${ARCHIVE}" -oraw_extract -y || unrar x -y "${ARCHIVE}" raw_extract/); then
+              echo "⚠️ Failed to extract $ARCHIVE"
+              notify_tg "⚠️ Failed & Skipped: $ARCHIVE (Archive extraction error)"
+              rm -f "${ARCHIVE}" raw_extract
+              continue
+            fi
+            rm -f "${ARCHIVE}"
+
+            # Auto-detect Ren'Py root folder (works for both direct root and nested subfolders)
+            GAME_SUBDIR=$(find raw_extract -type d -name "game" | awk '{ print length, $0 }' | sort -n | head -n 1 | cut -d" " -f2-)
+            if [ -z "$GAME_SUBDIR" ]; then
+              echo "⚠️ Skipping $ARCHIVE: No 'game' folder found inside archive."
+              notify_tg "⚠️ Failed & Skipped: $ARCHIVE (No 'game' folder found — might not be a Ren'Py game)"
+              rm -rf raw_extract
+              continue
+            fi
+            RENPY_ROOT=$(dirname "$GAME_SUBDIR")
+            cp -a "$RENPY_ROOT"/. game_src/
+            rm -rf raw_extract
+
             find game_src/game -name "*.rpa" | sort | while read -r rpa; do
-              python3 /usr/local/bin/rpatool -x "$rpa" -o game_src/game/
+              python3 /usr/local/bin/rpatool -x "$rpa" -o game_src/game/ || true
               rm -f "$rpa"
             done
 
@@ -235,7 +258,12 @@ jobs:
           + game/**
           PROGTXT
 
-            ./renpy_sdk/renpy.sh ./renpy_sdk/launcher web_build game_src --destination web_out
+            if ! ./renpy_sdk/renpy.sh ./renpy_sdk/launcher web_build game_src --destination web_out; then
+              echo "⚠️ Web build failed for $ARCHIVE, skipping..."
+              notify_tg "⚠️ Failed & Skipped: $ARCHIVE (Ren'Py web_build error)"
+              rm -rf game_src web_out
+              continue
+            fi
 
             cat << 'PYSCRIPT' > pack_chunks.py
           import os, re, zipfile, json, shutil
@@ -302,7 +330,12 @@ jobs:
             gh release delete "$TAG" --yes --cleanup-tag || true
             gh release create "$TAG" --title "Progressive Stream: $SLUG" --notes "Lossless 45MB chunks"
             if ls chunks_out/chunk_*.zip 1> /dev/null 2>&1; then
-              gh release upload "$TAG" chunks_out/chunk_*.zip
+              if ! gh release upload "$TAG" chunks_out/chunk_*.zip; then
+                echo "⚠️ Release upload failed for $ARCHIVE"
+                notify_tg "⚠️ Failed & Skipped: $ARCHIVE (GitHub Release upload error)"
+                rm -rf game_src web_out chunks_out pack_chunks.py
+                continue
+              fi
             fi
 
             cat << 'INJECTPY' > inject_loader.py
@@ -596,11 +629,11 @@ jobs:
             rm -rf "site_root/$SLUG"
             mv web_out "site_root/$SLUG"
             date +%s > "site_root/$SLUG/.built_ts"
-            rm -rf raw_extract game_src chunks_out pack_chunks.py inject_loader.py
-          done
+            rm -rf game_src chunks_out pack_chunks.py inject_loader.py
 
-          cd site_root
-          python3 - << 'EVICTPY'
+            (
+              cd site_root
+              python3 - << 'EVICTPY'
           import os, shutil, subprocess
 
           MAX_BYTES = 850 * 1024 * 1024
@@ -634,7 +667,7 @@ jobs:
               total -= sz
           EVICTPY
 
-          python3 - << 'INDEXPY'
+              python3 - << 'INDEXPY'
           import os
           games = sorted([d for d in os.listdir('.') if os.path.isdir(d) and not d.startswith('.') and os.path.exists(os.path.join(d, 'index.html'))])
           cards = "\n".join([f'<a href="./{g}/" style="display:block;padding:18px;margin:10px;background:#1e1e2e;color:#fff;text-decoration:none;border-radius:10px;font:600 18px sans-serif;border:1px solid #313244;">▶ {g.upper()} <span style="float:right;color:#a6e3a1;font-size:13px;">/{g}/</span></a>' for g in games])
@@ -642,14 +675,10 @@ jobs:
               f.write(f'<!DOCTYPE html><html><head><meta charset="utf-8"><title>Game Stream Library</title></head><body style="background:#11111b;color:#cdd6f4;font-family:sans-serif;max-width:700px;margin:40px auto;padding:20px;"><h1>🎮 Cloud Ren\'Py Library</h1>{cards}</body></html>')
           INDEXPY
 
-          git config user.name "github-actions[bot]"
-          git config user.email "github-actions[bot]@users.noreply.github.com"
-          git add -A
-          git commit -m "Deploy games" || echo "Nothing new to commit"
-          git push origin gh-pages
+              git add -A
+              git commit -m "Deploy $SLUG" || true
+              git push origin gh-pages
+            )
+          done
 
-          if [ -n "$TG_TOKEN" ] && [ -n "$TG_CHAT" ]; then
-            curl -s -X POST "https://api.telegram.org/bot${TG_TOKEN}/sendMessage" \
-              -H "Content-Type: application/json" \
-              -d "{\"chat_id\":\"${TG_CHAT}\",\"text\":\"✅ Build & Deploy Complete! Send /status to view ready game links & storage.\"}" >/dev/null
-          fi
+          notify_tg "✅ Batch Build Finished! Send /status to view ready game links & storage."
