@@ -22,12 +22,11 @@ jobs:
       - name: Checkout Repo
         uses: actions/checkout@v4
 
-      - name: Install Tools, rpatool & Official Ren'Py SDK (Universal Builder)
+      - name: Install Tools, rpatool & Official Ren'Py SDK
         run: |
           sudo apt-get update
           sudo apt-get install -y p7zip-full unrar wget zip unzip python3 tar bzip2
           curl -fsSL https://rclone.org/install.sh | sudo bash
-
           wget -q "https://raw.githubusercontent.com/Shizmob/rpatool/master/rpatool" -O /usr/local/bin/rpatool
           chmod +x /usr/local/bin/rpatool
 
@@ -49,7 +48,7 @@ jobs:
           mkdir -p ~/.config/rclone
           echo "${{ secrets.RCLONE_CONFIG_BASE64 }}" | base64 -d > ~/.config/rclone/rclone.conf
 
-      - name: Pull Game, Auto-Compile Universal Web Build & Split 180MB Chunks
+      - name: Pull Game, Compile Web Build & Split 180MB Chunks
         run: |
           mkdir -p raw_extract game_src web_out chunks_out
           rclone copyto "gdrive:Games/${{ github.event.inputs.archive_name }}" "./${{ github.event.inputs.archive_name }}" --multi-thread-streams 8 --drive-chunk-size 128M -P
@@ -65,14 +64,13 @@ jobs:
             mv raw_extract/* game_src/
           fi
 
-          # Unpack all .rpa archives losslessly so Ren'Py SDK indexes every asset
+          # Unpack all .rpa archives losslessly
           find game_src/game -name "*.rpa" | sort | while read -r rpa; do
-            echo "Losslessly unpacking $rpa..."
             python3 /usr/local/bin/rpatool -x "$rpa" -o game_src/game/
             rm -f "$rpa"
           done
 
-          # Enable Ren'Py native progressive download for all media assets
+          # Keep scripts, fonts, AND small .webm/.mp4 videos (<50MB) in direct web_out so HTML5 <video> plays natively with 0 errors
           cat << 'PROGTXT' > game_src/game/progressive_download.txt
           - game/**.rpy
           - game/**.rpyc
@@ -82,12 +80,10 @@ jobs:
           + game/**
           PROGTXT
 
-          # Universal Ren'Py SDK Web Build
           ./renpy_sdk/renpy.sh ./renpy_sdk/launcher web_build game_src --destination web_out
 
-          # Pack unpacked progressive media into ~180 MB lossless chunks (prioritizing GUI/menu assets in chunk_000)
           cat << 'PYSCRIPT' > pack_chunks.py
-          import os, zipfile, json, shutil
+          import os, zipfile, json
 
           prog_dir = "web_out/game"
           chunks_dir = "chunks_out"
@@ -100,11 +96,13 @@ jobs:
                       full_path = os.path.join(root, fname)
                       rel_path = os.path.relpath(full_path, "web_out").replace("\\", "/")
                       size = os.path.getsize(full_path)
+                      # Leave .webm/.mp4 videos (<90MB) directly in web_out/game/ so <video> tag loads them natively without XHR
+                      if fname.lower().endswith(('.webm', '.mp4', '.ogv')) and size < 90 * 1024 * 1024:
+                          continue
                       heavy_files.append((full_path, rel_path, size))
 
           def priority_key(item):
               p = item[1].lower()
-              # Put GUI, main menu, splash, fonts, and audio first so chunk_000 loads crisp menu immediately
               if any(k in p for k in ['/gui/', 'splash', 'menu', 'logo', 'black', 'idle', 'hover', '.ogg', '.mp3']):
                   return (0, p)
               return (1, p)
@@ -133,10 +131,15 @@ jobs:
                   cur_zip.write(full_path, rel_path)
                   manifest[rel_path] = cur_name
                   cur_size += size
+                  os.remove(full_path)
               cur_zip.close()
 
-          if os.path.exists(prog_dir):
-              shutil.rmtree(prog_dir)
+          # Clean empty directories inside web_out/game
+          for root, dirs, _ in os.walk(prog_dir, topdown=False):
+              for d in dirs:
+                  dp = os.path.join(root, d)
+                  if not os.listdir(dp):
+                      os.rmdir(dp)
 
           with open("web_out/stream_manifest.json", "w", encoding="utf-8") as f:
               json.dump(manifest, f)
@@ -147,7 +150,7 @@ jobs:
           python3 pack_chunks.py
           rm -rf raw_extract game_src renpy_sdk pack_chunks.py
 
-      - name: Upload Progressive Chunks to GitHub Releases & Inject Universal Fetch+XHR 1GB Buffer
+      - name: Upload Chunks & Inject Clean Prototype XHR + Fetch 1GB Auto-Evict Buffer
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           GAME_SLUG: ${{ github.event.inputs.game_slug }}
@@ -156,7 +159,6 @@ jobs:
           TAG="game-${GAME_SLUG}"
           gh release delete "$TAG" --yes --cleanup-tag || true
           gh release create "$TAG" --title "Progressive Stream: $GAME_SLUG" --notes "Lossless progressive chunks"
-
           if ls chunks_out/chunk_*.zip 1> /dev/null 2>&1; then
             gh release upload "$TAG" chunks_out/chunk_*.zip
           fi
@@ -180,7 +182,6 @@ jobs:
           <script src="https://cdn.jsdelivr.net/npm/fflate@0.8.2/umd/index.js"></script>
           <script>
           (function() {
-            // Unregister old service workers that return 503 on streamed assets
             if ('serviceWorker' in navigator) {
               navigator.serviceWorker.getRegistrations().then(regs => {
                 for (const r of regs) r.unregister();
@@ -190,9 +191,8 @@ jobs:
             const BASE_URL = __BASE_URL__;
             const MANIFEST = __MANIFEST__;
             const ALL_CHUNKS = __CHUNKS__;
-            const MAX_BUFFER_BYTES = 1024 * 1024 * 1024; // 1 GB Rolling FIFO Buffer
+            const MAX_BUFFER_BYTES = 900 * 1024 * 1024; // ~900 MB Rolling FIFO Buffer (strictly under 1GB)
 
-            // Build fast lookup suffix map (handles both 'game/images/x.png' and '/images/x.png')
             const SUFFIX_MAP = new Map();
             for (const [k, chunk] of Object.entries(MANIFEST)) {
               SUFFIX_MAP.set('/' + k, { key: k, chunk });
@@ -202,7 +202,7 @@ jobs:
             }
 
             function resolveAsset(rawUrl) {
-              if (!rawUrl) return null;
+              if (!rawUrl || typeof rawUrl !== 'string') return null;
               let cleanPath = rawUrl.split('?')[0].split('#')[0];
               try { cleanPath = decodeURIComponent(cleanPath); } catch (e) {}
               cleanPath = cleanPath.replace(/\\/+/g, '/');
@@ -216,6 +216,7 @@ jobs:
             const inflightChunks = new Map();
             let currentBufferBytes = 0;
 
+            // Strictly evict oldest played chunks and clear memory references
             function evictIfNeeded(neededBytes) {
               while (currentBufferBytes + neededBytes > MAX_BUFFER_BYTES && fifoCache.size > 0) {
                 let oldestKey = null;
@@ -229,11 +230,12 @@ jobs:
                 if (!oldestKey) break;
                 const removed = fifoCache.get(oldestKey);
                 currentBufferBytes -= removed.size;
+                removed.files.clear();
                 fifoCache.delete(oldestKey);
               }
             }
 
-            const origFetch = window.fetch;
+            const origFetch = window.fetch.bind(window);
 
             async function loadChunk(chunkName) {
               if (fifoCache.has(chunkName)) {
@@ -247,7 +249,8 @@ jobs:
 
               const promise = (async () => {
                 const res = await origFetch(BASE_URL + "/" + chunkName);
-                const buf = new Uint8Array(await res.arrayBuffer());
+                const ab = await res.arrayBuffer();
+                const buf = new Uint8Array(ab);
                 const unzipped = fflate.unzipSync(buf);
                 const fileMap = new Map();
                 let totalSize = 0;
@@ -261,7 +264,7 @@ jobs:
                 currentBufferBytes += totalSize;
                 inflightChunks.delete(chunkName);
 
-                // Background lookahead preload of next 2 chunks (~360 MB)
+                // Preload next 2 chunks (~360 MB) ahead
                 const idx = ALL_CHUNKS.indexOf(chunkName);
                 if (idx !== -1) {
                   for (let next = idx + 1; next <= idx + 2 && next < ALL_CHUNKS.length; next++) {
@@ -283,104 +286,65 @@ jobs:
               return entry.files.get(info.key) || null;
             }
 
-            // Start preloading chunk_000 immediately before game even finishes booting
-            if (ALL_CHUNKS.length > 0) {
-              loadChunk(ALL_CHUNKS[0]).catch(() => {});
-            }
-
-            // 1. Intercept window.fetch
+            // 1. Safe fetch override
             window.fetch = async function(resource, init) {
               const rawUrl = (typeof resource === 'string') ? resource : (resource && resource.url) || '';
               const info = resolveAsset(rawUrl);
               if (info) {
                 const bytes = await getAssetBytes(info);
                 if (bytes) {
-                  return new Response(bytes, {
-                    status: 200,
-                    headers: { 'Content-Type': 'application/octet-stream' }
-                  });
+                  return new Response(bytes, { status: 200 });
                 }
               }
-              return origFetch.apply(this, arguments);
+              return origFetch(resource, init);
             };
 
-            // 2. Intercept XMLHttpRequest (used by Ren'Py Web requests.js progressive loader)
-            const OrigXHR = window.XMLHttpRequest;
-            function CustomXHR() {
-              const xhr = new OrigXHR();
-              let matchedInfo = null;
-              let customResponseType = '';
-              let listeners = {};
+            // 2. Prototype-level XHR hook (never breaks game.zip or renpy.wasm native XHR!)
+            const origOpen = XMLHttpRequest.prototype.open;
+            const origSend = XMLHttpRequest.prototype.send;
 
-              const origOpen = xhr.open;
-              xhr.open = function(method, url, asyncFlag, user, pass) {
-                matchedInfo = resolveAsset(url);
-                if (!matchedInfo) {
-                  return origOpen.apply(xhr, arguments);
-                }
-              };
+            XMLHttpRequest.prototype.open = function(method, url) {
+              this._streamInfo = resolveAsset(url);
+              return origOpen.apply(this, arguments);
+            };
 
-              Object.defineProperty(xhr, 'responseType', {
-                get: () => matchedInfo ? customResponseType : xhr.responseType,
-                set: (val) => {
-                  customResponseType = val;
-                  if (!matchedInfo) xhr.responseType = val;
-                }
-              });
-
-              const origAddEvent = xhr.addEventListener.bind(xhr);
-              xhr.addEventListener = function(type, fn, opts) {
-                if (!listeners[type]) listeners[type] = [];
-                listeners[type].push(fn);
-                return origAddEvent(type, fn, opts);
-              };
-
-              function fireEvent(type) {
-                const ev = new Event(type);
-                if (typeof xhr['on' + type] === 'function') xhr['on' + type](ev);
-                if (listeners[type]) listeners[type].forEach(fn => fn.call(xhr, ev));
+            XMLHttpRequest.prototype.send = function(body) {
+              const info = this._streamInfo;
+              if (!info) {
+                return origSend.apply(this, arguments);
               }
-
-              const origSend = xhr.send;
-              xhr.send = function(body) {
-                if (!matchedInfo) {
-                  return origSend.apply(xhr, arguments);
+              const xhr = this;
+              getAssetBytes(info).then(bytes => {
+                if (!bytes) {
+                  Object.defineProperty(xhr, 'status', { value: 404 });
+                  Object.defineProperty(xhr, 'readyState', { value: 4 });
+                  xhr.dispatchEvent(new Event('readystatechange'));
+                  xhr.dispatchEvent(new Event('error'));
+                  return;
                 }
-                getAssetBytes(matchedInfo).then(bytes => {
-                  if (!bytes) {
-                    Object.defineProperty(xhr, 'status', { get: () => 404 });
-                    Object.defineProperty(xhr, 'readyState', { get: () => 4 });
-                    fireEvent('readystatechange');
-                    fireEvent('error');
-                    return;
-                  }
-                  const ab = bytes.buffer.slice(bytes.byteOffset, bytes.byteOffset + bytes.byteLength);
-                  let respVal = ab;
-                  if (customResponseType === 'blob') respVal = new Blob([bytes]);
-                  else if (customResponseType === 'text' || customResponseType === '') respVal = new TextDecoder().decode(bytes);
-                  else if (customResponseType === 'json') respVal = JSON.parse(new TextDecoder().decode(bytes));
+                const ab = bytes.buffer.slice(bytes.byteOffset, bytes.byteOffset + bytes.byteLength);
+                let respVal = ab;
+                if (xhr.responseType === 'blob') respVal = new Blob([bytes]);
+                else if (xhr.responseType === 'text' || xhr.responseType === '') respVal = new TextDecoder().decode(bytes);
+                else if (xhr.responseType === 'json') respVal = JSON.parse(new TextDecoder().decode(bytes));
 
-                  Object.defineProperty(xhr, 'status', { get: () => 200 });
-                  Object.defineProperty(xhr, 'statusText', { get: () => 'OK' });
-                  Object.defineProperty(xhr, 'readyState', { get: () => 4 });
-                  Object.defineProperty(xhr, 'response', { get: () => respVal });
-                  if (customResponseType === '' || customResponseType === 'text') {
-                    Object.defineProperty(xhr, 'responseText', { get: () => respVal });
-                  }
-                  fireEvent('readystatechange');
-                  fireEvent('load');
-                  fireEvent('loadend');
-                }).catch(() => {
-                  Object.defineProperty(xhr, 'status', { get: () => 500 });
-                  Object.defineProperty(xhr, 'readyState', { get: () => 4 });
-                  fireEvent('readystatechange');
-                  fireEvent('error');
-                });
-              };
-
-              return xhr;
-            }
-            window.XMLHttpRequest = CustomXHR;
+                Object.defineProperty(xhr, 'status', { value: 200 });
+                Object.defineProperty(xhr, 'statusText', { value: 'OK' });
+                Object.defineProperty(xhr, 'readyState', { value: 4 });
+                Object.defineProperty(xhr, 'response', { value: respVal });
+                if (xhr.responseType === '' || xhr.responseType === 'text') {
+                  Object.defineProperty(xhr, 'responseText', { value: respVal });
+                }
+                xhr.dispatchEvent(new Event('readystatechange'));
+                xhr.dispatchEvent(new Event('load'));
+                xhr.dispatchEvent(new Event('loadend'));
+              }).catch(() => {
+                Object.defineProperty(xhr, 'status', { value: 500 });
+                Object.defineProperty(xhr, 'readyState', { value: 4 });
+                xhr.dispatchEvent(new Event('readystatechange'));
+                xhr.dispatchEvent(new Event('error'));
+              });
+            };
           })();
           </script>
           """
