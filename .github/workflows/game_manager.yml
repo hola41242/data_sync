@@ -38,13 +38,13 @@ jobs:
 
           if [ -n "$TG_TOKEN" ] && [ -n "$TG_CHAT" ]; then
             python3 - << 'TGPY'
-          import os, urllib.request, json
-          list_out = os.environ.get("LIST_OUT", "").strip()
-          comma_out = os.environ.get("COMMA_OUT", "").strip()
-          msg = "📂 *Google Drive (`gdrive:Games`):*\n\n" + (f"```\n{list_out}\n```\n\n📋 *Copy-Paste Build Command:*\n`/build {comma_out}`" if list_out else "_No archives found._")
+          import os, html, urllib.request, json
+          list_out = html.escape(os.environ.get("LIST_OUT", "").strip())
+          comma_out = html.escape(os.environ.get("COMMA_OUT", "").strip())
+          msg = "📂 <b>Google Drive (gdrive:Games):</b>\n\n" + (f"<pre>{list_out}</pre>\n\n📋 <b>Copy-Paste Build Command:</b>\n<code>/build {comma_out}</code>" if list_out else "<i>No archives found.</i>")
           req = urllib.request.Request(
               f"https://api.telegram.org/bot{os.environ['TG_TOKEN']}/sendMessage",
-              data=json.dumps({"chat_id": os.environ["TG_CHAT"], "text": msg[:4000], "parse_mode": "Markdown"}).encode(),
+              data=json.dumps({"chat_id": os.environ["TG_CHAT"], "text": msg[:4000], "parse_mode": "HTML"}).encode(),
               headers={"Content-Type": "application/json"}
           )
           urllib.request.urlopen(req)
@@ -69,7 +69,7 @@ jobs:
           fi
 
           python3 - << 'STATPY'
-          import os, urllib.request, json
+          import os, html, urllib.request, json
 
           def dir_size(path):
               total = 0
@@ -84,18 +84,18 @@ jobs:
           for g in games:
               sz = dir_size(g)
               total_bytes += sz
-              lines.append(f"• `{g}` ({round(sz/1048576, 1)} MB) → https://hola41242.github.io/data_sync/{g}/")
+              lines.append(f"• <code>{html.escape(g)}</code> ({round(sz/1048576, 1)} MB) → https://hola41242.github.io/data_sync/{g}/")
 
           used_mb = round(total_bytes / 1048576, 1)
           free_mb = round(max(0, 850 - used_mb), 1)
-          body = "\n".join(lines) if lines else "_No live games deployed yet._"
-          msg = f"📊 *GitHub Pages Quota:* `{used_mb} MB / 850 MB` (`{free_mb} MB` free)\n\n🎮 *Ready Builds ({len(games)}):*\n{body}"
+          body = "\n".join(lines) if lines else "<i>No live games deployed yet.</i>"
+          msg = f"📊 <b>GitHub Pages Quota:</b> <code>{used_mb} MB / 850 MB</code> (<code>{free_mb} MB</code> free)\n\n🎮 <b>Ready Builds ({len(games)}):</b>\n{body}"
           print(msg)
 
           if os.environ.get("TG_TOKEN") and os.environ.get("TG_CHAT"):
               req = urllib.request.Request(
                   f"https://api.telegram.org/bot{os.environ['TG_TOKEN']}/sendMessage",
-                  data=json.dumps({"chat_id": os.environ["TG_CHAT"], "text": msg[:4000], "parse_mode": "Markdown", "disable_web_page_preview": True}).encode(),
+                  data=json.dumps({"chat_id": os.environ["TG_CHAT"], "text": msg[:4000], "parse_mode": "HTML", "disable_web_page_preview": True}).encode(),
                   headers={"Content-Type": "application/json"}
               )
               urllib.request.urlopen(req)
