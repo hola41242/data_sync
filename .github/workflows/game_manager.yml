@@ -1,12 +1,12 @@
-name: Universal RenPy Lossless Web Streamer (Auto-Batch + 0ms Blur)
+name: Universal RenPy Lossless Web Streamer (Drive List + Multi-Build)
 
 on:
   workflow_dispatch:
     inputs:
       target_archive:
-        description: 'Enter "ALL" to auto-build all new games in gdrive:Games, or a specific filename'
+        description: 'Enter "LIST" to print Drive games, "ALL" for new games, or comma-separated filenames'
         required: true
-        default: 'ALL'
+        default: 'CampusBonds-0.5-market.zip'
 
 permissions:
   contents: write
@@ -18,11 +18,29 @@ jobs:
       - name: Checkout Repo
         uses: actions/checkout@v4
 
+      - name: Configure Rclone
+        run: |
+          curl -fsSL https://rclone.org/install.sh | sudo bash
+          mkdir -p ~/.config/rclone
+          echo "${{ secrets.RCLONE_CONFIG_BASE64 }}" | base64 -d > ~/.config/rclone/rclone.conf
+
+      - name: List Games in Google Drive (If target_archive == LIST)
+        if: ${{ github.event.inputs.target_archive == 'LIST' || github.event.inputs.target_archive == 'list' }}
+        run: |
+          echo "========================================================"
+          echo "AVAILABLE ARCHIVES IN gdrive:Games:"
+          echo "========================================================"
+          rclone lsf gdrive:Games --files-only | grep -iE '\.(zip|rar|7z)$' | sort
+          echo ""
+          echo "COPY-PASTE READY (ALL COMMA-SEPARATED):"
+          rclone lsf gdrive:Games --files-only | grep -iE '\.(zip|rar|7z)$' | sort | paste -sd ", " -
+          echo "========================================================"
+
       - name: Install Tools, rpatool & Official Ren'Py SDK
+        if: ${{ github.event.inputs.target_archive != 'LIST' && github.event.inputs.target_archive != 'list' }}
         run: |
           sudo apt-get update
           sudo apt-get install -y p7zip-full unrar wget zip unzip python3 tar bzip2
-          curl -fsSL https://rclone.org/install.sh | sudo bash
           wget -q "https://raw.githubusercontent.com/Shizmob/rpatool/master/rpatool" -O /usr/local/bin/rpatool
           chmod +x /usr/local/bin/rpatool
 
@@ -39,35 +57,38 @@ jobs:
           cp -r "$WEB_INNER"/* renpy_sdk/web/
           rm -rf temp_web "renpy-${RENPY_VER}-web.zip"
 
-      - name: Configure Rclone
-        run: |
-          mkdir -p ~/.config/rclone
-          echo "${{ secrets.RCLONE_CONFIG_BASE64 }}" | base64 -d > ~/.config/rclone/rclone.conf
-
-      - name: Auto-Discover & Build Games into 45MB Zero-Stall Chunks
+      - name: Build Selected Games into 45MB Zero-Stall Chunks & Deploy
+        if: ${{ github.event.inputs.target_archive != 'LIST' && github.event.inputs.target_archive != 'list' }}
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           REPO_NAME: ${{ github.repository }}
           TARGET: ${{ github.event.inputs.target_archive }}
         run: |
           mkdir -p site_root
-          # Fetch existing gh-pages if present so previous games stay intact
-          git fetch origin gh-pages && git checkout origin/gh-pages -- . || true
-          rm -rf .github *.md 2>/dev/null || true
+          cd site_root
+          git init
+          git remote add origin "https://x-access-token:${GH_TOKEN}@github.com/${REPO_NAME}.git"
+          if git ls-remote --exit-code --heads origin gh-pages >/dev/null 2>&1; then
+            git fetch origin gh-pages
+            git checkout -b gh-pages origin/gh-pages
+          else
+            git checkout -b gh-pages
+          fi
+          cd ..
 
           if [ "$TARGET" = "ALL" ]; then
             FILES=$(rclone lsf gdrive:Games --files-only | grep -iE '\.(zip|rar|7z)$')
           else
-            FILES="$TARGET"
+            FILES=$(echo "$TARGET" | tr ',' '\n' | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')
           fi
 
           echo "$FILES" | while IFS= read -r ARCHIVE; do
             [ -z "$ARCHIVE" ] && continue
-            SLUG=$(echo "$ARCHIVE" | sed -E 's/\.[^.]+$//' | tr '[:upper:]' '[:lower:]' | sed -E 's/[^a-z0-9]+//g' | cut -c1-20)
+            SLUG=$(echo "$ARCHIVE" | sed -E 's/[-_][0-9].*$//' | sed -E 's/\.[^.]+$//' | tr '[:upper:]' '[:lower:]' | sed -E 's/[^a-z0-9]+//g' | cut -c1-20)
+            [ -z "$SLUG" ] && SLUG="game$(date +%s)"
             TAG="game-${SLUG}"
 
-            # Skip if already built in ALL mode
-            if [ "$TARGET" = "ALL" ] && [ -d "$SLUG" ] && gh release view "$TAG" >/dev/null 2>&1; then
+            if [ "$TARGET" = "ALL" ] && [ -d "site_root/$SLUG" ] && gh release view "$TAG" >/dev/null 2>&1; then
               echo "Skipping already live game: $SLUG ($ARCHIVE)"
               continue
             fi
@@ -105,7 +126,6 @@ jobs:
 
             ./renpy_sdk/renpy.sh ./renpy_sdk/launcher web_build game_src --destination web_out
 
-            # Split into 45MB chunks so Cloudflare Worker never stalls at 80MB
             cat << 'PYSCRIPT' > pack_chunks.py
           import os, zipfile, json, shutil
 
@@ -169,7 +189,6 @@ jobs:
               gh release upload "$TAG" chunks_out/chunk_*.zip
             fi
 
-            # Inject Zero-Blur Direct Emscripten FS Mount + XHR + Video Interceptor
             cat << 'INJECTPY' > inject_loader.py
           import os, json
 
@@ -201,7 +220,7 @@ jobs:
             const BASE_URL = __BASE_URL__;
             const MANIFEST = __MANIFEST__;
             const ALL_CHUNKS = __CHUNKS__;
-            const MAX_BUFFER_BYTES = 1024 * 1024 * 1024; // 1 GB RAM Buffer
+            const MAX_BUFFER_BYTES = 1024 * 1024 * 1024;
 
             let hud = null;
             function updateHud(text) {
@@ -234,7 +253,6 @@ jobs:
               return null;
             }
 
-            // Write unzipped HD files directly into Ren'Py Emscripten Virtual FS so 0ms blur occurs
             function writeToEmscriptenFS(relPath, uint8Data) {
               try {
                 const FS = (window.Module && window.Module.FS) || window.FS;
@@ -304,7 +322,6 @@ jobs:
                 inflightChunks.delete(chunkName);
                 updateHud(`HD Ready (${chunkName}) | RAM: ${Math.round(currentBufferBytes/1048576)}MB / 1024MB`);
 
-                // Preload next 8 chunks (~360 MB lookahead) in parallel pairs (fast, zero 80MB stall)
                 if (preloadCount > 0) {
                   const idx = ALL_CHUNKS.indexOf(chunkName);
                   if (idx !== -1) {
@@ -331,7 +348,6 @@ jobs:
               return entry.files.get(info.key) || null;
             }
 
-            // Re-sync cached chunks to Emscripten FS once Module boots
             const fsSyncTimer = setInterval(() => {
               const FS = (window.Module && window.Module.FS) || window.FS;
               if (FS) {
@@ -452,23 +468,22 @@ jobs:
           INJECTPY
 
             CUR_SLUG="$SLUG" python3 inject_loader.py
-            rm -rf "$SLUG"
-            mv web_out "$SLUG"
+            rm -rf "site_root/$SLUG"
+            mv web_out "site_root/$SLUG"
             rm -rf raw_extract game_src chunks_out pack_chunks.py inject_loader.py
           done
 
-          # Generate clean Jellyfin-style index portal listing all games automatically
+          cd site_root
           python3 - << 'INDEXPY'
           import os
-          games = sorted([d for d in os.listdir('.') if os.path.isdir(d) and os.path.exists(os.path.join(d, 'index.html'))])
-          cards = "\n".join([f'<a href="./{g}/" style="display:block;padding:18px;margin:10px;background:#1e1e2e;color:#fff;text-decoration:none;border-radius:10px;font:600 18px sans-serif;border:1px solid #313244;">▶ {g.upper()}</a>' for g in games])
+          games = sorted([d for d in os.listdir('.') if os.path.isdir(d) and not d.startswith('.') and os.path.exists(os.path.join(d, 'index.html'))])
+          cards = "\n".join([f'<a href="./{g}/" style="display:block;padding:18px;margin:10px;background:#1e1e2e;color:#fff;text-decoration:none;border-radius:10px;font:600 18px sans-serif;border:1px solid #313244;">▶ {g.upper()} <span style="float:right;color:#a6e3a1;font-size:13px;">/{g}/</span></a>' for g in games])
           with open("index.html", "w", encoding="utf-8") as f:
               f.write(f'<!DOCTYPE html><html><head><meta charset="utf-8"><title>Game Stream Library</title></head><body style="background:#11111b;color:#cdd6f4;font-family:sans-serif;max-width:700px;margin:40px auto;padding:20px;"><h1>🎮 Cloud Ren\'Py Library</h1>{cards}</body></html>')
           INDEXPY
 
-      - name: Deploy All Games + Portal to GitHub Pages
-        uses: peaceiris/actions-gh-pages@v4
-        with:
-          github_token: ${{ secrets.GITHUB_TOKEN }}
-          publish_dir: .
-          keep_files: false
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add -A
+          git commit -m "Deploy games" || echo "Nothing new to commit"
+          git push origin gh-pages
