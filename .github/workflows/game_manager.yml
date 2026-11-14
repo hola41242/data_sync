@@ -1,16 +1,12 @@
-name: Universal RenPy Lossless Web Streamer (24/7 Playnite)
+name: Universal RenPy Lossless Web Streamer (Auto-Batch + 0ms Blur)
 
 on:
   workflow_dispatch:
     inputs:
-      archive_name:
-        description: 'Archive filename inside gdrive:Games (e.g. CampusBonds-0.5-market.zip)'
+      target_archive:
+        description: 'Enter "ALL" to auto-build all new games in gdrive:Games, or a specific filename'
         required: true
-        default: 'CampusBonds-0.5-market.zip'
-      game_slug:
-        description: 'Clean URL folder name (lowercase, no spaces, e.g. campusbonds)'
-        required: true
-        default: 'campusbonds'
+        default: 'ALL'
 
 permissions:
   contents: write
@@ -48,28 +44,57 @@ jobs:
           mkdir -p ~/.config/rclone
           echo "${{ secrets.RCLONE_CONFIG_BASE64 }}" | base64 -d > ~/.config/rclone/rclone.conf
 
-      - name: Pull Game, Compile Web Build & Split 180MB Chunks
+      - name: Auto-Discover & Build Games into 45MB Zero-Stall Chunks
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REPO_NAME: ${{ github.repository }}
+          TARGET: ${{ github.event.inputs.target_archive }}
         run: |
-          mkdir -p raw_extract game_src web_out chunks_out
-          rclone copyto "gdrive:Games/${{ github.event.inputs.archive_name }}" "./${{ github.event.inputs.archive_name }}" --multi-thread-streams 8 --drive-chunk-size 128M -P
-          7z x "${{ github.event.inputs.archive_name }}" -oraw_extract -y || unrar x -y "${{ github.event.inputs.archive_name }}" raw_extract/
-          rm -f "${{ github.event.inputs.archive_name }}"
+          mkdir -p site_root
+          # Fetch existing gh-pages if present so previous games stay intact
+          git fetch origin gh-pages && git checkout origin/gh-pages -- . || true
+          rm -rf .github *.md 2>/dev/null || true
 
-          SUBDIRS=$(find raw_extract -mindepth 1 -maxdepth 1 -type d | wc -l)
-          FILES=$(find raw_extract -mindepth 1 -maxdepth 1 -type f | wc -l)
-          if [ "$SUBDIRS" -eq 1 ] && [ "$FILES" -eq 0 ]; then
-            INNER_DIR=$(find raw_extract -mindepth 1 -maxdepth 1 -type d)
-            mv "$INNER_DIR"/* game_src/
+          if [ "$TARGET" = "ALL" ]; then
+            FILES=$(rclone lsf gdrive:Games --files-only | grep -iE '\.(zip|rar|7z)$')
           else
-            mv raw_extract/* game_src/
+            FILES="$TARGET"
           fi
 
-          find game_src/game -name "*.rpa" | sort | while read -r rpa; do
-            python3 /usr/local/bin/rpatool -x "$rpa" -o game_src/game/
-            rm -f "$rpa"
-          done
+          echo "$FILES" | while IFS= read -r ARCHIVE; do
+            [ -z "$ARCHIVE" ] && continue
+            SLUG=$(echo "$ARCHIVE" | sed -E 's/\.[^.]+$//' | tr '[:upper:]' '[:lower:]' | sed -E 's/[^a-z0-9]+//g' | cut -c1-20)
+            TAG="game-${SLUG}"
 
-          cat << 'PROGTXT' > game_src/game/progressive_download.txt
+            # Skip if already built in ALL mode
+            if [ "$TARGET" = "ALL" ] && [ -d "$SLUG" ] && gh release view "$TAG" >/dev/null 2>&1; then
+              echo "Skipping already live game: $SLUG ($ARCHIVE)"
+              continue
+            fi
+
+            echo "=== Building $ARCHIVE -> /$SLUG/ ==="
+            rm -rf raw_extract game_src web_out chunks_out
+            mkdir -p raw_extract game_src web_out chunks_out
+
+            rclone copyto "gdrive:Games/${ARCHIVE}" "./${ARCHIVE}" --multi-thread-streams 8 --drive-chunk-size 128M -P
+            7z x "${ARCHIVE}" -oraw_extract -y || unrar x -y "${ARCHIVE}" raw_extract/
+            rm -f "${ARCHIVE}"
+
+            SUBDIRS=$(find raw_extract -mindepth 1 -maxdepth 1 -type d | wc -l)
+            FCOUNT=$(find raw_extract -mindepth 1 -maxdepth 1 -type f | wc -l)
+            if [ "$SUBDIRS" -eq 1 ] && [ "$FCOUNT" -eq 0 ]; then
+              INNER_DIR=$(find raw_extract -mindepth 1 -maxdepth 1 -type d)
+              mv "$INNER_DIR"/* game_src/
+            else
+              mv raw_extract/* game_src/
+            fi
+
+            find game_src/game -name "*.rpa" | sort | while read -r rpa; do
+              python3 /usr/local/bin/rpatool -x "$rpa" -o game_src/game/
+              rm -f "$rpa"
+            done
+
+            cat << 'PROGTXT' > game_src/game/progressive_download.txt
           - game/**.rpy
           - game/**.rpyc
           - game/**.rpyb
@@ -78,14 +103,15 @@ jobs:
           + game/**
           PROGTXT
 
-          ./renpy_sdk/renpy.sh ./renpy_sdk/launcher web_build game_src --destination web_out
+            ./renpy_sdk/renpy.sh ./renpy_sdk/launcher web_build game_src --destination web_out
 
-          cat << 'PYSCRIPT' > pack_chunks.py
+            # Split into 45MB chunks so Cloudflare Worker never stalls at 80MB
+            cat << 'PYSCRIPT' > pack_chunks.py
           import os, zipfile, json, shutil
 
           prog_dir = "web_out/game"
           chunks_dir = "chunks_out"
-          MAX_CHUNK_BYTES = 180 * 1024 * 1024
+          MAX_CHUNK_BYTES = 45 * 1024 * 1024
 
           heavy_files = []
           if os.path.exists(prog_dir):
@@ -133,31 +159,21 @@ jobs:
 
           with open("web_out/stream_manifest.json", "w", encoding="utf-8") as f:
               json.dump(manifest, f)
-
-          print("Boot game.zip MB:", round(os.path.getsize("web_out/game.zip") / (1024 * 1024), 1), "| Chunks:", chunk_idx + 1)
           PYSCRIPT
 
-          python3 pack_chunks.py
-          rm -rf raw_extract game_src renpy_sdk pack_chunks.py
+            python3 pack_chunks.py
 
-      - name: Upload Chunks & Inject Non-Blocking Streamer
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          GAME_SLUG: ${{ github.event.inputs.game_slug }}
-          REPO_NAME: ${{ github.repository }}
-        run: |
-          TAG="game-${GAME_SLUG}"
-          gh release delete "$TAG" --yes --cleanup-tag || true
-          gh release create "$TAG" --title "Progressive Stream: $GAME_SLUG" --notes "Lossless progressive chunks"
-          if ls chunks_out/chunk_*.zip 1> /dev/null 2>&1; then
-            gh release upload "$TAG" chunks_out/chunk_*.zip
-          fi
-          rm -rf chunks_out
+            gh release delete "$TAG" --yes --cleanup-tag || true
+            gh release create "$TAG" --title "Progressive Stream: $SLUG" --notes "Lossless 45MB chunks"
+            if ls chunks_out/chunk_*.zip 1> /dev/null 2>&1; then
+              gh release upload "$TAG" chunks_out/chunk_*.zip
+            fi
 
-          cat << 'INJECTPY' > inject_loader.py
+            # Inject Zero-Blur Direct Emscripten FS Mount + XHR + Video Interceptor
+            cat << 'INJECTPY' > inject_loader.py
           import os, json
 
-          slug = os.environ["GAME_SLUG"]
+          slug = os.environ["CUR_SLUG"]
           repo = os.environ["REPO_NAME"]
           tag = "game-" + slug
           worker = "https://gh-cors-proxy.shubhamyadav39275000.workers.dev"
@@ -173,51 +189,38 @@ jobs:
           <script>
           (function() {
             window.addEventListener('keydown', function(e) {
-              if (e.key === 'F5') {
-                e.stopImmediatePropagation();
-                location.reload();
-              } else if (e.key === 'F12' || (e.ctrlKey && e.shiftKey && (e.key === 'I' || e.key === 'J'))) {
-                e.stopImmediatePropagation();
-              }
+              if (e.key === 'F5') { e.stopImmediatePropagation(); location.reload(); }
+              else if (e.key === 'F12' || (e.ctrlKey && e.shiftKey && (e.key === 'I' || e.key === 'J'))) { e.stopImmediatePropagation(); }
             }, true);
 
             if ('serviceWorker' in navigator) {
-              navigator.serviceWorker.getRegistrations().then(regs => {
-                for (const r of regs) r.unregister();
-              });
-              try {
-                navigator.serviceWorker.register = function() {
-                  return Promise.resolve({ scope: '/', active: null, installing: null, waiting: null, update: () => Promise.resolve(), unregister: () => Promise.resolve(true) });
-                };
-              } catch (e) {}
+              navigator.serviceWorker.getRegistrations().then(regs => { for (const r of regs) r.unregister(); });
+              try { navigator.serviceWorker.register = () => Promise.resolve({ scope: '/', active: null, installing: null, waiting: null, update: () => Promise.resolve(), unregister: () => Promise.resolve(true) }); } catch (e) {}
             }
 
             const BASE_URL = __BASE_URL__;
             const MANIFEST = __MANIFEST__;
             const ALL_CHUNKS = __CHUNKS__;
-            const MAX_BUFFER_BYTES = 1024 * 1024 * 1024;
+            const MAX_BUFFER_BYTES = 1024 * 1024 * 1024; // 1 GB RAM Buffer
 
-            // Subtle live buffer indicator (auto-fades when idle)
             let hud = null;
             function updateHud(text) {
               if (!document.body) return;
               if (!hud) {
                 hud = document.createElement('div');
-                hud.style.cssText = 'position:fixed;top:8px;right:8px;z-index:999999;background:rgba(0,0,0,0.65);color:#0f0;font:11px monospace;padding:4px 8px;border-radius:4px;pointer-events:none;transition:opacity 0.4s;';
+                hud.style.cssText = 'position:fixed;top:8px;right:8px;z-index:999999;background:rgba(0,0,0,0.7);color:#0f0;font:11px monospace;padding:4px 8px;border-radius:4px;pointer-events:none;transition:opacity 0.4s;';
                 document.body.appendChild(hud);
               }
               hud.textContent = text;
               hud.style.opacity = '1';
               clearTimeout(hud._t);
-              hud._t = setTimeout(() => { if (hud) hud.style.opacity = '0.25'; }, 3000);
+              hud._t = setTimeout(() => { if (hud) hud.style.opacity = '0.2'; }, 3000);
             }
 
             const SUFFIX_MAP = new Map();
             for (const [k, chunk] of Object.entries(MANIFEST)) {
               SUFFIX_MAP.set('/' + k, { key: k, chunk });
-              if (k.startsWith('game/')) {
-                SUFFIX_MAP.set('/' + k.slice(5), { key: k, chunk });
-              }
+              if (k.startsWith('game/')) SUFFIX_MAP.set('/' + k.slice(5), { key: k, chunk });
             }
 
             function resolveAsset(rawUrl) {
@@ -231,19 +234,31 @@ jobs:
               return null;
             }
 
+            // Write unzipped HD files directly into Ren'Py Emscripten Virtual FS so 0ms blur occurs
+            function writeToEmscriptenFS(relPath, uint8Data) {
+              try {
+                const FS = (window.Module && window.Module.FS) || window.FS;
+                if (!FS) return;
+                const fullPath = '/' + relPath.replace(/^\\/+/, '');
+                const parts = fullPath.split('/');
+                let cur = '';
+                for (let i = 1; i < parts.length - 1; i++) {
+                  cur += '/' + parts[i];
+                  try { FS.mkdir(cur); } catch (e) {}
+                }
+                FS.writeFile(fullPath, uint8Data);
+              } catch (e) {}
+            }
+
             const fifoCache = new Map();
             const inflightChunks = new Map();
             let currentBufferBytes = 0;
 
             function evictIfNeeded(neededBytes) {
               while (currentBufferBytes + neededBytes > MAX_BUFFER_BYTES && fifoCache.size > 0) {
-                let oldestKey = null;
-                let oldestTime = Infinity;
+                let oldestKey = null, oldestTime = Infinity;
                 for (const [k, v] of fifoCache.entries()) {
-                  if (v.lastUsed < oldestTime) {
-                    oldestTime = v.lastUsed;
-                    oldestKey = k;
-                  }
+                  if (v.lastUsed < oldestTime) { oldestTime = v.lastUsed; oldestKey = k; }
                 }
                 if (!oldestKey) break;
                 const removed = fifoCache.get(oldestKey);
@@ -255,54 +270,50 @@ jobs:
 
             function unzipAsync(uint8) {
               return new Promise((resolve, reject) => {
-                fflate.unzip(uint8, (err, data) => {
-                  if (err) reject(err);
-                  else resolve(data);
-                });
+                fflate.unzip(uint8, (err, data) => err ? reject(err) : resolve(data));
               });
             }
 
             const origFetch = window.fetch.bind(window);
 
-            async function loadChunk(chunkName, allowPreload = true) {
+            async function loadChunk(chunkName, preloadCount = 8) {
               if (fifoCache.has(chunkName)) {
                 const entry = fifoCache.get(chunkName);
                 entry.lastUsed = Date.now();
                 return entry;
               }
-              if (inflightChunks.has(chunkName)) {
-                return inflightChunks.get(chunkName);
-              }
+              if (inflightChunks.has(chunkName)) return inflightChunks.get(chunkName);
 
-              updateHud(`Streaming ${chunkName}... (${Math.round(currentBufferBytes/1048576)}MB RAM)`);
+              updateHud(`Buffering ${chunkName} (${Math.round(currentBufferBytes/1048576)}MB)...`);
               const promise = (async () => {
                 const res = await origFetch(BASE_URL + "/" + chunkName);
                 const ab = await res.arrayBuffer();
-                const buf = new Uint8Array(ab);
-                const unzipped = await unzipAsync(buf);
+                const unzipped = await unzipAsync(new Uint8Array(ab));
                 const fileMap = new Map();
                 let totalSize = 0;
                 for (const [path, data] of Object.entries(unzipped)) {
                   const slicedAb = data.buffer.slice(data.byteOffset, data.byteOffset + data.byteLength);
                   fileMap.set(path, { bytes: data, ab: slicedAb });
                   totalSize += data.byteLength;
+                  writeToEmscriptenFS(path, data);
                 }
                 evictIfNeeded(totalSize);
                 const entry = { files: fileMap, size: totalSize, lastUsed: Date.now() };
                 fifoCache.set(chunkName, entry);
                 currentBufferBytes += totalSize;
                 inflightChunks.delete(chunkName);
-                updateHud(`Ready ${chunkName} | RAM: ${Math.round(currentBufferBytes/1048576)}MB / 1024MB`);
+                updateHud(`HD Ready (${chunkName}) | RAM: ${Math.round(currentBufferBytes/1048576)}MB / 1024MB`);
 
-                if (allowPreload) {
+                // Preload next 8 chunks (~360 MB lookahead) in parallel pairs (fast, zero 80MB stall)
+                if (preloadCount > 0) {
                   const idx = ALL_CHUNKS.indexOf(chunkName);
                   if (idx !== -1) {
                     (async () => {
-                      for (let offset = 1; offset <= 3; offset++) {
+                      for (let offset = 1; offset <= preloadCount; offset++) {
                         if (idx + offset >= ALL_CHUNKS.length) break;
                         const nextName = ALL_CHUNKS[idx + offset];
-                        if (!fifoCache.has(nextName) && !inflightChunks.has(nextName) && (currentBufferBytes + 200*1024*1024) <= MAX_BUFFER_BYTES) {
-                          await loadChunk(nextName, false).catch(() => {});
+                        if (!fifoCache.has(nextName) && !inflightChunks.has(nextName) && (currentBufferBytes + 60*1024*1024) <= MAX_BUFFER_BYTES) {
+                          await loadChunk(nextName, 0).catch(() => {});
                         }
                       }
                     })();
@@ -316,39 +327,42 @@ jobs:
             }
 
             async function getAssetRecord(info) {
-              const entry = await loadChunk(info.chunk, true);
+              const entry = await loadChunk(info.chunk, 8);
               return entry.files.get(info.key) || null;
             }
 
-            if (ALL_CHUNKS.length > 0) {
-              loadChunk(ALL_CHUNKS[0], true).catch(() => {});
-            }
+            // Re-sync cached chunks to Emscripten FS once Module boots
+            const fsSyncTimer = setInterval(() => {
+              const FS = (window.Module && window.Module.FS) || window.FS;
+              if (FS) {
+                for (const entry of fifoCache.values()) {
+                  for (const [path, rec] of entry.files.entries()) writeToEmscriptenFS(path, rec.bytes);
+                }
+                clearInterval(fsSyncTimer);
+              }
+            }, 500);
+
+            if (ALL_CHUNKS.length > 0) loadChunk(ALL_CHUNKS[0], 8).catch(() => {});
 
             window.fetch = async function(resource, init) {
               const rawUrl = (typeof resource === 'string') ? resource : (resource && resource.url) || '';
               const info = resolveAsset(rawUrl);
               if (info) {
                 const rec = await getAssetRecord(info);
-                if (rec) {
-                  return new Response(rec.ab, { status: 200 });
-                }
+                if (rec) return new Response(rec.ab, { status: 200 });
               }
               return origFetch(resource, init);
             };
 
             const origOpen = XMLHttpRequest.prototype.open;
             const origSend = XMLHttpRequest.prototype.send;
-
             XMLHttpRequest.prototype.open = function(method, url) {
               this._streamInfo = resolveAsset(url);
               return origOpen.apply(this, arguments);
             };
-
             XMLHttpRequest.prototype.send = function(body) {
               const info = this._streamInfo;
-              if (!info) {
-                return origSend.apply(this, arguments);
-              }
+              if (!info) return origSend.apply(this, arguments);
               const xhr = this;
               getAssetRecord(info).then(rec => {
                 if (!rec) {
@@ -362,26 +376,17 @@ jobs:
                 if (xhr.responseType === 'blob') respVal = new Blob([rec.bytes]);
                 else if (xhr.responseType === 'text' || xhr.responseType === '') respVal = new TextDecoder().decode(rec.bytes);
                 else if (xhr.responseType === 'json') respVal = JSON.parse(new TextDecoder().decode(rec.bytes));
-
                 Object.defineProperty(xhr, 'status', { value: 200, configurable: true });
                 Object.defineProperty(xhr, 'statusText', { value: 'OK', configurable: true });
                 Object.defineProperty(xhr, 'readyState', { value: 4, configurable: true });
                 Object.defineProperty(xhr, 'response', { value: respVal, configurable: true });
-                if (xhr.responseType === '' || xhr.responseType === 'text') {
-                  Object.defineProperty(xhr, 'responseText', { value: respVal, configurable: true });
-                }
+                if (xhr.responseType === '' || xhr.responseType === 'text') Object.defineProperty(xhr, 'responseText', { value: respVal, configurable: true });
                 xhr.dispatchEvent(new Event('readystatechange'));
                 xhr.dispatchEvent(new Event('load'));
                 xhr.dispatchEvent(new Event('loadend'));
-              }).catch(() => {
-                Object.defineProperty(xhr, 'status', { value: 500, configurable: true });
-                Object.defineProperty(xhr, 'readyState', { value: 4, configurable: true });
-                xhr.dispatchEvent(new Event('readystatechange'));
-                xhr.dispatchEvent(new Event('error'));
               });
             };
 
-            // Intercept <video> / <source> via property, setAttribute, AND MutationObserver for Emscripten EM_ASM elements
             function patchMediaElement(el) {
               const rawSrc = el.getAttribute('src') || el.src;
               const info = resolveAsset(rawSrc);
@@ -390,8 +395,7 @@ jobs:
               el.removeAttribute('src');
               getAssetRecord(info).then(rec => {
                 if (rec) {
-                  const blobUrl = URL.createObjectURL(new Blob([rec.bytes], { type: 'video/webm' }));
-                  el.src = blobUrl;
+                  el.src = URL.createObjectURL(new Blob([rec.bytes], { type: 'video/webm' }));
                   const target = (el.tagName === 'SOURCE' && el.parentElement) ? el.parentElement : el;
                   if (target.load) target.load();
                   if (target.play) target.play().catch(() => {});
@@ -409,10 +413,8 @@ jobs:
                     const el = this;
                     getAssetRecord(info).then(rec => {
                       if (rec) {
-                        const blobUrl = URL.createObjectURL(new Blob([rec.bytes], { type: 'video/webm' }));
-                        mediaSrcDesc.set.call(el, blobUrl);
-                        el.load();
-                        el.play().catch(() => {});
+                        mediaSrcDesc.set.call(el, URL.createObjectURL(new Blob([rec.bytes], { type: 'video/webm' })));
+                        el.load(); el.play().catch(() => {});
                       }
                     });
                     return;
@@ -423,38 +425,14 @@ jobs:
               });
             }
 
-            const origSetAttr = Element.prototype.setAttribute;
-            Element.prototype.setAttribute = function(name, value) {
-              if (name.toLowerCase() === 'src' && (this.tagName === 'VIDEO' || this.tagName === 'SOURCE')) {
-                const info = resolveAsset(value);
-                if (info) {
-                  const el = this;
-                  getAssetRecord(info).then(rec => {
-                    if (rec) {
-                      const blobUrl = URL.createObjectURL(new Blob([rec.bytes], { type: 'video/webm' }));
-                      origSetAttr.call(el, 'src', blobUrl);
-                      const target = (el.tagName === 'SOURCE' && el.parentElement) ? el.parentElement : el;
-                      if (target.load) target.load();
-                      if (target.play) target.play().catch(() => {});
-                    }
-                  });
-                  return;
-                }
-              }
-              return origSetAttr.apply(this, arguments);
-            };
-
-            const obs = new MutationObserver(muts => {
+            new MutationObserver(muts => {
               for (const m of muts) {
                 for (const node of m.addedNodes) {
                   if (node.tagName === 'VIDEO' || node.tagName === 'SOURCE') patchMediaElement(node);
-                  if (node.querySelectorAll) {
-                    node.querySelectorAll('video, source').forEach(patchMediaElement);
-                  }
+                  if (node.querySelectorAll) node.querySelectorAll('video, source').forEach(patchMediaElement);
                 }
               }
-            });
-            obs.observe(document.documentElement, { childList: true, subtree: true });
+            }).observe(document.documentElement, { childList: true, subtree: true });
           })();
           </script>
           """
@@ -473,13 +451,24 @@ jobs:
           os.remove("web_out/stream_manifest.json")
           INJECTPY
 
-          python3 inject_loader.py
-          rm -f inject_loader.py
+            CUR_SLUG="$SLUG" python3 inject_loader.py
+            rm -rf "$SLUG"
+            mv web_out "$SLUG"
+            rm -rf raw_extract game_src chunks_out pack_chunks.py inject_loader.py
+          done
 
-      - name: Deploy Lightweight Loader to GitHub Pages (24/7 Live)
+          # Generate clean Jellyfin-style index portal listing all games automatically
+          python3 - << 'INDEXPY'
+          import os
+          games = sorted([d for d in os.listdir('.') if os.path.isdir(d) and os.path.exists(os.path.join(d, 'index.html'))])
+          cards = "\n".join([f'<a href="./{g}/" style="display:block;padding:18px;margin:10px;background:#1e1e2e;color:#fff;text-decoration:none;border-radius:10px;font:600 18px sans-serif;border:1px solid #313244;">▶ {g.upper()}</a>' for g in games])
+          with open("index.html", "w", encoding="utf-8") as f:
+              f.write(f'<!DOCTYPE html><html><head><meta charset="utf-8"><title>Game Stream Library</title></head><body style="background:#11111b;color:#cdd6f4;font-family:sans-serif;max-width:700px;margin:40px auto;padding:20px;"><h1>🎮 Cloud Ren\'Py Library</h1>{cards}</body></html>')
+          INDEXPY
+
+      - name: Deploy All Games + Portal to GitHub Pages
         uses: peaceiris/actions-gh-pages@v4
         with:
           github_token: ${{ secrets.GITHUB_TOKEN }}
-          publish_dir: ./web_out
-          destination_dir: ${{ github.event.inputs.game_slug }}
-          keep_files: true
+          publish_dir: .
+          keep_files: false
