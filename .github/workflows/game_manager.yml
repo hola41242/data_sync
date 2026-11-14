@@ -172,7 +172,6 @@ jobs:
           <script src="https://cdn.jsdelivr.net/npm/fflate@0.8.2/umd/index.js"></script>
           <script>
           (function() {
-            // 0. Allow F5 refresh & F12 DevTools even when Ren'Py SDL2 canvas has keyboard focus
             window.addEventListener('keydown', function(e) {
               if (e.key === 'F5') {
                 e.stopImmediatePropagation();
@@ -182,7 +181,6 @@ jobs:
               }
             }, true);
 
-            // 1. Permanently block Service Worker registration
             if ('serviceWorker' in navigator) {
               navigator.serviceWorker.getRegistrations().then(regs => {
                 for (const r of regs) r.unregister();
@@ -197,7 +195,22 @@ jobs:
             const BASE_URL = __BASE_URL__;
             const MANIFEST = __MANIFEST__;
             const ALL_CHUNKS = __CHUNKS__;
-            const MAX_BUFFER_BYTES = 1024 * 1024 * 1024; // 1 GB Rolling FIFO Buffer
+            const MAX_BUFFER_BYTES = 1024 * 1024 * 1024;
+
+            // Subtle live buffer indicator (auto-fades when idle)
+            let hud = null;
+            function updateHud(text) {
+              if (!document.body) return;
+              if (!hud) {
+                hud = document.createElement('div');
+                hud.style.cssText = 'position:fixed;top:8px;right:8px;z-index:999999;background:rgba(0,0,0,0.65);color:#0f0;font:11px monospace;padding:4px 8px;border-radius:4px;pointer-events:none;transition:opacity 0.4s;';
+                document.body.appendChild(hud);
+              }
+              hud.textContent = text;
+              hud.style.opacity = '1';
+              clearTimeout(hud._t);
+              hud._t = setTimeout(() => { if (hud) hud.style.opacity = '0.25'; }, 3000);
+            }
 
             const SUFFIX_MAP = new Map();
             for (const [k, chunk] of Object.entries(MANIFEST)) {
@@ -251,7 +264,6 @@ jobs:
 
             const origFetch = window.fetch.bind(window);
 
-            // Pre-slice ArrayBuffers right after unzip so XHR responses are zero-copy instant (0ms blur on Skip)
             async function loadChunk(chunkName, allowPreload = true) {
               if (fifoCache.has(chunkName)) {
                 const entry = fifoCache.get(chunkName);
@@ -262,6 +274,7 @@ jobs:
                 return inflightChunks.get(chunkName);
               }
 
+              updateHud(`Streaming ${chunkName}... (${Math.round(currentBufferBytes/1048576)}MB RAM)`);
               const promise = (async () => {
                 const res = await origFetch(BASE_URL + "/" + chunkName);
                 const ab = await res.arrayBuffer();
@@ -279,8 +292,8 @@ jobs:
                 fifoCache.set(chunkName, entry);
                 currentBufferBytes += totalSize;
                 inflightChunks.delete(chunkName);
+                updateHud(`Ready ${chunkName} | RAM: ${Math.round(currentBufferBytes/1048576)}MB / 1024MB`);
 
-                // Preload 3 chunks ahead (~540 MB) sequentially so Skip never outruns the buffer
                 if (allowPreload) {
                   const idx = ALL_CHUNKS.indexOf(chunkName);
                   if (idx !== -1) {
@@ -307,12 +320,10 @@ jobs:
               return entry.files.get(info.key) || null;
             }
 
-            // Start preloading chunk_000 & chunk_001 immediately while engine boots
             if (ALL_CHUNKS.length > 0) {
               loadChunk(ALL_CHUNKS[0], true).catch(() => {});
             }
 
-            // 2. Fetch override
             window.fetch = async function(resource, init) {
               const rawUrl = (typeof resource === 'string') ? resource : (resource && resource.url) || '';
               const info = resolveAsset(rawUrl);
@@ -325,7 +336,6 @@ jobs:
               return origFetch(resource, init);
             };
 
-            // 3. Zero-copy Prototype XHR hook (instant response for fast Skip)
             const origOpen = XMLHttpRequest.prototype.open;
             const origSend = XMLHttpRequest.prototype.send;
 
@@ -371,7 +381,24 @@ jobs:
               });
             };
 
-            // 4. HTML5 <video> property + setAttribute hook
+            // Intercept <video> / <source> via property, setAttribute, AND MutationObserver for Emscripten EM_ASM elements
+            function patchMediaElement(el) {
+              const rawSrc = el.getAttribute('src') || el.src;
+              const info = resolveAsset(rawSrc);
+              if (!info || el._streamPatched) return;
+              el._streamPatched = true;
+              el.removeAttribute('src');
+              getAssetRecord(info).then(rec => {
+                if (rec) {
+                  const blobUrl = URL.createObjectURL(new Blob([rec.bytes], { type: 'video/webm' }));
+                  el.src = blobUrl;
+                  const target = (el.tagName === 'SOURCE' && el.parentElement) ? el.parentElement : el;
+                  if (target.load) target.load();
+                  if (target.play) target.play().catch(() => {});
+                }
+              });
+            }
+
             const mediaSrcDesc = Object.getOwnPropertyDescriptor(HTMLMediaElement.prototype, 'src');
             if (mediaSrcDesc && mediaSrcDesc.set) {
               Object.defineProperty(HTMLMediaElement.prototype, 'src', {
@@ -406,13 +433,9 @@ jobs:
                     if (rec) {
                       const blobUrl = URL.createObjectURL(new Blob([rec.bytes], { type: 'video/webm' }));
                       origSetAttr.call(el, 'src', blobUrl);
-                      if (el.tagName === 'SOURCE' && el.parentElement) {
-                        el.parentElement.load();
-                        el.parentElement.play().catch(() => {});
-                      } else if (el.load) {
-                        el.load();
-                        el.play().catch(() => {});
-                      }
+                      const target = (el.tagName === 'SOURCE' && el.parentElement) ? el.parentElement : el;
+                      if (target.load) target.load();
+                      if (target.play) target.play().catch(() => {});
                     }
                   });
                   return;
@@ -420,6 +443,18 @@ jobs:
               }
               return origSetAttr.apply(this, arguments);
             };
+
+            const obs = new MutationObserver(muts => {
+              for (const m of muts) {
+                for (const node of m.addedNodes) {
+                  if (node.tagName === 'VIDEO' || node.tagName === 'SOURCE') patchMediaElement(node);
+                  if (node.querySelectorAll) {
+                    node.querySelectorAll('video, source').forEach(patchMediaElement);
+                  }
+                }
+              }
+            });
+            obs.observe(document.documentElement, { childList: true, subtree: true });
           })();
           </script>
           """
