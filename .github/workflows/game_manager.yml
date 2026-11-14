@@ -98,7 +98,7 @@ jobs:
 
           def priority_key(item):
               p = item[1].lower()
-              if any(k in p for k in ['/gui/', 'splash', 'menu', 'logo', 'black', 'idle', 'hover', '.ogg', '.mp3', '_anim.webm']):
+              if any(k in p for k in ['/gui/', 'splash', 'menu', 'logo', 'black', 'idle', 'hover', '.ogg', '.mp3', '_anim.webm', 'episode1', 'season1/episode1']):
                   return (0, p)
               return (1, p)
 
@@ -128,7 +128,6 @@ jobs:
                   cur_size += size
               cur_zip.close()
 
-          # Remove entire web_out/game so gh-pages push stays tiny (~75MB) and never hits HTTP 500
           if os.path.exists(prog_dir):
               shutil.rmtree(prog_dir)
 
@@ -141,7 +140,7 @@ jobs:
           python3 pack_chunks.py
           rm -rf raw_extract game_src renpy_sdk pack_chunks.py
 
-      - name: Upload Chunks & Inject Fetch + Prototype XHR + HTML5 Video Blob Hook
+      - name: Upload Chunks & Inject Non-Blocking Streamer
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           GAME_SLUG: ${{ github.event.inputs.game_slug }}
@@ -173,16 +172,32 @@ jobs:
           <script src="https://cdn.jsdelivr.net/npm/fflate@0.8.2/umd/index.js"></script>
           <script>
           (function() {
+            // 0. Allow F5 refresh & F12 DevTools even when Ren'Py SDL2 canvas has keyboard focus
+            window.addEventListener('keydown', function(e) {
+              if (e.key === 'F5') {
+                e.stopImmediatePropagation();
+                location.reload();
+              } else if (e.key === 'F12' || (e.ctrlKey && e.shiftKey && (e.key === 'I' || e.key === 'J'))) {
+                e.stopImmediatePropagation();
+              }
+            }, true);
+
+            // 1. Permanently block Service Worker registration
             if ('serviceWorker' in navigator) {
               navigator.serviceWorker.getRegistrations().then(regs => {
                 for (const r of regs) r.unregister();
               });
+              try {
+                navigator.serviceWorker.register = function() {
+                  return Promise.resolve({ scope: '/', active: null, installing: null, waiting: null, update: () => Promise.resolve(), unregister: () => Promise.resolve(true) });
+                };
+              } catch (e) {}
             }
 
             const BASE_URL = __BASE_URL__;
             const MANIFEST = __MANIFEST__;
             const ALL_CHUNKS = __CHUNKS__;
-            const MAX_BUFFER_BYTES = 900 * 1024 * 1024;
+            const MAX_BUFFER_BYTES = 1024 * 1024 * 1024; // 1 GB Rolling FIFO Buffer
 
             const SUFFIX_MAP = new Map();
             for (const [k, chunk] of Object.entries(MANIFEST)) {
@@ -193,7 +208,7 @@ jobs:
             }
 
             function resolveAsset(rawUrl) {
-              if (!rawUrl || typeof rawUrl !== 'string') return null;
+              if (!rawUrl || typeof rawUrl !== 'string' || rawUrl.startsWith('blob:') || rawUrl.startsWith('data:')) return null;
               let cleanPath = rawUrl.split('?')[0].split('#')[0];
               try { cleanPath = decodeURIComponent(cleanPath); } catch (e) {}
               cleanPath = cleanPath.replace(/\\/+/g, '/');
@@ -225,9 +240,19 @@ jobs:
               }
             }
 
+            function unzipAsync(uint8) {
+              return new Promise((resolve, reject) => {
+                fflate.unzip(uint8, (err, data) => {
+                  if (err) reject(err);
+                  else resolve(data);
+                });
+              });
+            }
+
             const origFetch = window.fetch.bind(window);
 
-            async function loadChunk(chunkName) {
+            // Pre-slice ArrayBuffers right after unzip so XHR responses are zero-copy instant (0ms blur on Skip)
+            async function loadChunk(chunkName, allowPreload = true) {
               if (fifoCache.has(chunkName)) {
                 const entry = fifoCache.get(chunkName);
                 entry.lastUsed = Date.now();
@@ -241,11 +266,12 @@ jobs:
                 const res = await origFetch(BASE_URL + "/" + chunkName);
                 const ab = await res.arrayBuffer();
                 const buf = new Uint8Array(ab);
-                const unzipped = fflate.unzipSync(buf);
+                const unzipped = await unzipAsync(buf);
                 const fileMap = new Map();
                 let totalSize = 0;
                 for (const [path, data] of Object.entries(unzipped)) {
-                  fileMap.set(path, data);
+                  const slicedAb = data.buffer.slice(data.byteOffset, data.byteOffset + data.byteLength);
+                  fileMap.set(path, { bytes: data, ab: slicedAb });
                   totalSize += data.byteLength;
                 }
                 evictIfNeeded(totalSize);
@@ -254,13 +280,19 @@ jobs:
                 currentBufferBytes += totalSize;
                 inflightChunks.delete(chunkName);
 
-                const idx = ALL_CHUNKS.indexOf(chunkName);
-                if (idx !== -1) {
-                  for (let next = idx + 1; next <= idx + 2 && next < ALL_CHUNKS.length; next++) {
-                    const nextName = ALL_CHUNKS[next];
-                    if (!fifoCache.has(nextName) && !inflightChunks.has(nextName) && (currentBufferBytes + 200*1024*1024) <= MAX_BUFFER_BYTES) {
-                      loadChunk(nextName).catch(() => {});
-                    }
+                // Preload 3 chunks ahead (~540 MB) sequentially so Skip never outruns the buffer
+                if (allowPreload) {
+                  const idx = ALL_CHUNKS.indexOf(chunkName);
+                  if (idx !== -1) {
+                    (async () => {
+                      for (let offset = 1; offset <= 3; offset++) {
+                        if (idx + offset >= ALL_CHUNKS.length) break;
+                        const nextName = ALL_CHUNKS[idx + offset];
+                        if (!fifoCache.has(nextName) && !inflightChunks.has(nextName) && (currentBufferBytes + 200*1024*1024) <= MAX_BUFFER_BYTES) {
+                          await loadChunk(nextName, false).catch(() => {});
+                        }
+                      }
+                    })();
                   }
                 }
                 return entry;
@@ -270,25 +302,30 @@ jobs:
               return promise;
             }
 
-            async function getAssetBytes(info) {
-              const entry = await loadChunk(info.chunk);
+            async function getAssetRecord(info) {
+              const entry = await loadChunk(info.chunk, true);
               return entry.files.get(info.key) || null;
             }
 
-            // 1. Safe fetch override
+            // Start preloading chunk_000 & chunk_001 immediately while engine boots
+            if (ALL_CHUNKS.length > 0) {
+              loadChunk(ALL_CHUNKS[0], true).catch(() => {});
+            }
+
+            // 2. Fetch override
             window.fetch = async function(resource, init) {
               const rawUrl = (typeof resource === 'string') ? resource : (resource && resource.url) || '';
               const info = resolveAsset(rawUrl);
               if (info) {
-                const bytes = await getAssetBytes(info);
-                if (bytes) {
-                  return new Response(bytes, { status: 200 });
+                const rec = await getAssetRecord(info);
+                if (rec) {
+                  return new Response(rec.ab, { status: 200 });
                 }
               }
               return origFetch(resource, init);
             };
 
-            // 2. Prototype-level XHR hook
+            // 3. Zero-copy Prototype XHR hook (instant response for fast Skip)
             const origOpen = XMLHttpRequest.prototype.open;
             const origSend = XMLHttpRequest.prototype.send;
 
@@ -303,53 +340,78 @@ jobs:
                 return origSend.apply(this, arguments);
               }
               const xhr = this;
-              getAssetBytes(info).then(bytes => {
-                if (!bytes) {
-                  Object.defineProperty(xhr, 'status', { value: 404 });
-                  Object.defineProperty(xhr, 'readyState', { value: 4 });
+              getAssetRecord(info).then(rec => {
+                if (!rec) {
+                  Object.defineProperty(xhr, 'status', { value: 404, configurable: true });
+                  Object.defineProperty(xhr, 'readyState', { value: 4, configurable: true });
                   xhr.dispatchEvent(new Event('readystatechange'));
                   xhr.dispatchEvent(new Event('error'));
                   return;
                 }
-                const ab = bytes.buffer.slice(bytes.byteOffset, bytes.byteOffset + bytes.byteLength);
-                let respVal = ab;
-                if (xhr.responseType === 'blob') respVal = new Blob([bytes]);
-                else if (xhr.responseType === 'text' || xhr.responseType === '') respVal = new TextDecoder().decode(bytes);
-                else if (xhr.responseType === 'json') respVal = JSON.parse(new TextDecoder().decode(bytes));
+                let respVal = rec.ab;
+                if (xhr.responseType === 'blob') respVal = new Blob([rec.bytes]);
+                else if (xhr.responseType === 'text' || xhr.responseType === '') respVal = new TextDecoder().decode(rec.bytes);
+                else if (xhr.responseType === 'json') respVal = JSON.parse(new TextDecoder().decode(rec.bytes));
 
-                Object.defineProperty(xhr, 'status', { value: 200 });
-                Object.defineProperty(xhr, 'statusText', { value: 'OK' });
-                Object.defineProperty(xhr, 'readyState', { value: 4 });
-                Object.defineProperty(xhr, 'response', { value: respVal });
+                Object.defineProperty(xhr, 'status', { value: 200, configurable: true });
+                Object.defineProperty(xhr, 'statusText', { value: 'OK', configurable: true });
+                Object.defineProperty(xhr, 'readyState', { value: 4, configurable: true });
+                Object.defineProperty(xhr, 'response', { value: respVal, configurable: true });
                 if (xhr.responseType === '' || xhr.responseType === 'text') {
-                  Object.defineProperty(xhr, 'responseText', { value: respVal });
+                  Object.defineProperty(xhr, 'responseText', { value: respVal, configurable: true });
                 }
                 xhr.dispatchEvent(new Event('readystatechange'));
                 xhr.dispatchEvent(new Event('load'));
                 xhr.dispatchEvent(new Event('loadend'));
               }).catch(() => {
-                Object.defineProperty(xhr, 'status', { value: 500 });
-                Object.defineProperty(xhr, 'readyState', { value: 4 });
+                Object.defineProperty(xhr, 'status', { value: 500, configurable: true });
+                Object.defineProperty(xhr, 'readyState', { value: 4, configurable: true });
                 xhr.dispatchEvent(new Event('readystatechange'));
                 xhr.dispatchEvent(new Event('error'));
               });
             };
 
-            // 3. HTML5 <video> / <source> Blob hook (serves .webm/.mp4 from chunk buffer with 0 GitHub Pages bloat)
+            // 4. HTML5 <video> property + setAttribute hook
+            const mediaSrcDesc = Object.getOwnPropertyDescriptor(HTMLMediaElement.prototype, 'src');
+            if (mediaSrcDesc && mediaSrcDesc.set) {
+              Object.defineProperty(HTMLMediaElement.prototype, 'src', {
+                get: mediaSrcDesc.get,
+                set: function(val) {
+                  const info = resolveAsset(val);
+                  if (info) {
+                    const el = this;
+                    getAssetRecord(info).then(rec => {
+                      if (rec) {
+                        const blobUrl = URL.createObjectURL(new Blob([rec.bytes], { type: 'video/webm' }));
+                        mediaSrcDesc.set.call(el, blobUrl);
+                        el.load();
+                        el.play().catch(() => {});
+                      }
+                    });
+                    return;
+                  }
+                  mediaSrcDesc.set.call(this, val);
+                },
+                configurable: true
+              });
+            }
+
             const origSetAttr = Element.prototype.setAttribute;
             Element.prototype.setAttribute = function(name, value) {
               if (name.toLowerCase() === 'src' && (this.tagName === 'VIDEO' || this.tagName === 'SOURCE')) {
                 const info = resolveAsset(value);
                 if (info) {
                   const el = this;
-                  getAssetBytes(info).then(bytes => {
-                    if (bytes) {
-                      const blobUrl = URL.createObjectURL(new Blob([bytes], { type: 'video/webm' }));
+                  getAssetRecord(info).then(rec => {
+                    if (rec) {
+                      const blobUrl = URL.createObjectURL(new Blob([rec.bytes], { type: 'video/webm' }));
                       origSetAttr.call(el, 'src', blobUrl);
-                      if (el.tagName === 'SOURCE' && el.parentElement && el.parentElement.load) {
+                      if (el.tagName === 'SOURCE' && el.parentElement) {
                         el.parentElement.load();
+                        el.parentElement.play().catch(() => {});
                       } else if (el.load) {
                         el.load();
+                        el.play().catch(() => {});
                       }
                     }
                   });
