@@ -153,10 +153,8 @@ jobs:
           wget -q "https://raw.githubusercontent.com/Shizmob/rpatool/master/rpatool" -O /usr/local/bin/rpatool
           chmod +x /usr/local/bin/rpatool
 
-          # 1) Modern unrpyc (Python 3 for Ren'Py 8.0 - 8.5)
           git clone --depth 1 https://github.com/CensoredUsername/unrpyc.git /opt/unrpyc_py3
 
-          # 2) Legacy unrpyc (Python 2 for Ren'Py 6/7 games)
           git clone --depth 1 --branch legacy https://github.com/CensoredUsername/unrpyc.git /opt/unrpyc_py2 || git clone --depth 1 https://github.com/CensoredUsername/unrpyc.git /opt/unrpyc_py2
           RENPY7_VER="7.7.3"
           wget -q "https://www.renpy.org/dl/${RENPY7_VER}/renpy-${RENPY7_VER}-sdk.tar.bz2"
@@ -164,7 +162,6 @@ jobs:
           mv "renpy-${RENPY7_VER}-sdk" renpy7_sdk
           rm -f "renpy-${RENPY7_VER}-sdk.tar.bz2"
 
-          # 3) Latest Ren'Py 8.5.0 Web Build SDK (supports config.image_directories & all 8.x/7.x scripts)
           RENPY_VER="8.5.0"
           wget -q "https://www.renpy.org/dl/${RENPY_VER}/renpy-${RENPY_VER}-sdk.tar.bz2"
           tar -xjf "renpy-${RENPY_VER}-sdk.tar.bz2"
@@ -259,13 +256,11 @@ jobs:
             cp -a "$RENPY_ROOT"/. game_src/
             rm -rf raw_extract
 
-            # Unpack all .rpa archives
             find game_src/game -name "*.rpa" | sort | while read -r rpa; do
               python3 /usr/local/bin/rpatool -x "$rpa" -o game_src/game/ || true
               rm -f "$rpa"
             done
 
-            # Dual unrpyc: Step A (Py3 for Ren'Py 8.x), Step B (Ren'Py 7.7.3 Py2 for legacy Ren'Py 6/7)
             python3 /opt/unrpyc_py3/unrpyc.py -c game_src/game/ >/dev/null 2>&1 || true
             PY2_BIN=$(find renpy7_sdk/lib -name "python" -type f | head -n 1)
             if [ -n "$PY2_BIN" ]; then
@@ -273,7 +268,6 @@ jobs:
             fi
             find game_src/game \( -name "*.rpyc" -o -name "*.rpymc" \) -delete
 
-            # Trace exact story execution order from 'label start:' across jump/call graph
             cat << 'TRACEPY' > trace_story.py
           import os, re, json
 
@@ -393,7 +387,6 @@ jobs:
           TRACEPY
             python3 trace_story.py || echo "{}" > script_order.json
 
-            # Transcode ONLY non-WebM videos (.mkv/.mp4/.avi/.mov/.ogv) OR audio-less .webm into browser-safe VP8/Vorbis
             find game_src/game -type f \( -iname "*.mkv" -o -iname "*.mp4" -o -iname "*.avi" -o -iname "*.mov" -o -iname "*.ogv" \) | while read -r vid; do
               echo "Transcoding non-WebM video: $vid"
               if ffmpeg -nostdin -y -i "$vid" -f lavfi -i anullsrc=channel_layout=stereo:sample_rate=44100 \
@@ -406,7 +399,6 @@ jobs:
               fi
             done
 
-            # Fast stream-copy silent audio into audio-less .webm files (takes <0.05s per file, no video re-encode)
             find game_src/game -type f -iname "*.webm" | while read -r wvid; do
               HAS_AUDIO=$(ffprobe -v error -select_streams a -show_entries stream=codec_type -of csv=p=0 "$wvid" 2>/dev/null)
               if [ -z "$HAS_AUDIO" ]; then
@@ -419,7 +411,8 @@ jobs:
               fi
             done
 
-            python3 -c 'open("game_src/game/progressive_download.txt", "w").write("- game/**.rpy\n- game/**.rpyc\n- game/**.rpyb\n- game/**.ttf\n- game/**.otf\n+ game/**\n")'
+            # Keep scripts, fonts, AND game/gui/** in game.zip; stream all scene/CG/audio/video media cleanly
+            python3 -c 'open("game_src/game/progressive_download.txt", "w").write("- game/**.rpy\n- game/**.rpyc\n- game/**.rpyb\n- game/**.ttf\n- game/**.otf\n- game/gui/**\n+ game/**\n")'
 
             if ! timeout 15m xvfb-run -a ./renpy_sdk/renpy.sh ./renpy_sdk/launcher web_build game_src --destination web_out </dev/null; then
               notify_tg "⚠️ Failed & Skipped: $ARCHIVE (Ren'Py web_build error)"
@@ -428,6 +421,7 @@ jobs:
             fi
             rm -rf game_src trace_story.py
 
+            # Strip blurred scene/character placeholders from game.zip while preserving game/gui/ so boot never fails
             python3 - << 'STRIPBLUR'
           import zipfile, os
           gzip_path = "web_out/game.zip"
@@ -436,7 +430,7 @@ jobs:
               with zipfile.ZipFile(gzip_path, 'r') as zin, zipfile.ZipFile(tmp_zip, 'w', zipfile.ZIP_DEFLATED) as zout:
                   for item in zin.infolist():
                       low = item.filename.lower()
-                      if not low.endswith(('.png', '.jpg', '.jpeg', '.webp', '.avif', '.webm', '.mp4', '.mkv', '.ogv', '.ogg', '.mp3', '.wav')):
+                      if low.startswith('game/gui/') or not low.endswith(('.png', '.jpg', '.jpeg', '.webp', '.avif', '.webm', '.mp4', '.mkv', '.ogv', '.ogg', '.mp3', '.wav')):
                           zout.writestr(item, zin.read(item.filename))
               os.replace(tmp_zip, gzip_path)
           STRIPBLUR
@@ -479,7 +473,7 @@ jobs:
 
           def priority_key(item):
               p = item[1].lower()
-              if any(k in p for k in ['/gui/', 'splash', 'menu', 'logo', 'black', 'idle', 'hover']):
+              if any(k in p for k in ['splash', 'menu', 'logo', 'black', 'idle', 'hover']):
                   return (0, 0, natural_tokens(p))
               if p in rank_map:
                   return (1, rank_map[p], natural_tokens(p))
