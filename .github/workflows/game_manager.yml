@@ -175,6 +175,7 @@ jobs:
           TG_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TG_CHAT: ${{ secrets.TELEGRAM_CHAT_ID }}
         run: |
+          set +e
           notify_tg() {
             local MSG="$1"
             if [ -n "$TG_TOKEN" ] && [ -n "$TG_CHAT" ]; then
@@ -218,25 +219,21 @@ jobs:
             mkdir -p raw_extract game_src web_out chunks_out
 
             if ! rclone copyto "gdrive:Games/${ARCHIVE}" "./${ARCHIVE}" --multi-thread-streams 8 --drive-chunk-size 128M -P; then
-              echo "⚠️ Failed to download $ARCHIVE"
               notify_tg "⚠️ Failed & Skipped: $ARCHIVE (Google Drive download error)"
               rm -f "${ARCHIVE}"
               continue
             fi
 
             if ! (7z x "${ARCHIVE}" -oraw_extract -y || unrar x -y "${ARCHIVE}" raw_extract/); then
-              echo "⚠️ Failed to extract $ARCHIVE"
               notify_tg "⚠️ Failed & Skipped: $ARCHIVE (Archive extraction error)"
-              rm -f "${ARCHIVE}" raw_extract
+              rm -rf "${ARCHIVE}" raw_extract
               continue
             fi
             rm -f "${ARCHIVE}"
 
-            # Auto-detect Ren'Py root folder (works for both direct root and nested subfolders)
             GAME_SUBDIR=$(find raw_extract -type d -name "game" | awk '{ print length, $0 }' | sort -n | head -n 1 | cut -d" " -f2-)
             if [ -z "$GAME_SUBDIR" ]; then
-              echo "⚠️ Skipping $ARCHIVE: No 'game' folder found inside archive."
-              notify_tg "⚠️ Failed & Skipped: $ARCHIVE (No 'game' folder found — might not be a Ren'Py game)"
+              notify_tg "⚠️ Failed & Skipped: $ARCHIVE (No 'game' folder found)"
               rm -rf raw_extract
               continue
             fi
@@ -249,20 +246,23 @@ jobs:
               rm -f "$rpa"
             done
 
-            cat << 'PROGTXT' > game_src/game/progressive_download.txt
-          - game/**.rpy
-          - game/**.rpyc
-          - game/**.rpyb
-          - game/**.ttf
-          - game/**.otf
-          + game/**
-          PROGTXT
+            python3 -c 'open("game_src/game/progressive_download.txt", "w").write("- game/**.rpy\n- game/**.rpyc\n- game/**.rpyb\n- game/**.ttf\n- game/**.otf\n+ game/**\n")'
 
             if ! ./renpy_sdk/renpy.sh ./renpy_sdk/launcher web_build game_src --destination web_out; then
-              echo "⚠️ Web build failed for $ARCHIVE, skipping..."
               notify_tg "⚠️ Failed & Skipped: $ARCHIVE (Ren'Py web_build error)"
               rm -rf game_src web_out
               continue
+            fi
+            rm -rf game_src
+
+            if [ -f "web_out/game.zip" ]; then
+              GZIP_SIZE=$(stat -c%s "web_out/game.zip")
+              if [ "$GZIP_SIZE" -gt 99614720 ]; then
+                GZIP_MB=$((GZIP_SIZE / 1048576))
+                notify_tg "⚠️ Failed & Skipped: $ARCHIVE (game.zip is ${GZIP_MB}MB > 95MB GitHub file limit)"
+                rm -rf web_out chunks_out
+                continue
+              fi
             fi
 
             cat << 'PYSCRIPT' > pack_chunks.py
@@ -286,7 +286,8 @@ jobs:
 
           def priority_key(item):
               p = item[1].lower()
-              if any(k in p for k in ['/gui/', 'splash', 'menu', 'logo', 'black', 'idle', 'hover', '.ogg', '.mp3', '_anim.webm']):
+              # Tier 0: GUI, audio, AND all videos (.webm/.mp4/.ogv) so Emscripten FS pre-mounts them before C fopen()
+              if any(k in p for k in ['/gui/', 'splash', 'menu', 'logo', 'black', 'idle', 'hover', '.ogg', '.mp3', '.webm', '.mp4', '.ogv']):
                   return (0, natural_tokens(p))
               if re.search(r'(ep|episode|ch|chapter|part|day|act)[-_ ]?0*1\b|prologue|intro', p):
                   return (1, natural_tokens(p))
@@ -331,9 +332,8 @@ jobs:
             gh release create "$TAG" --title "Progressive Stream: $SLUG" --notes "Lossless 45MB chunks"
             if ls chunks_out/chunk_*.zip 1> /dev/null 2>&1; then
               if ! gh release upload "$TAG" chunks_out/chunk_*.zip; then
-                echo "⚠️ Release upload failed for $ARCHIVE"
                 notify_tg "⚠️ Failed & Skipped: $ARCHIVE (GitHub Release upload error)"
-                rm -rf game_src web_out chunks_out pack_chunks.py
+                rm -rf web_out chunks_out pack_chunks.py
                 continue
               fi
             fi
@@ -516,7 +516,10 @@ jobs:
               }
             }, 500);
 
-            if (ALL_CHUNKS.length > 0) loadChunk(ALL_CHUNKS[0], false, 2).catch(() => {});
+            // Preload initial Tier 0 chunks (GUI, Audio, Videos) immediately
+            for (let i = 0; i < Math.min(3, ALL_CHUNKS.length); i++) {
+              loadChunk(ALL_CHUNKS[i], false, 2).catch(() => {});
+            }
 
             window.fetch = async function(resource, init) {
               const rawUrl = (typeof resource === 'string') ? resource : (resource && resource.url) || '';
@@ -629,7 +632,7 @@ jobs:
             rm -rf "site_root/$SLUG"
             mv web_out "site_root/$SLUG"
             date +%s > "site_root/$SLUG/.built_ts"
-            rm -rf game_src chunks_out pack_chunks.py inject_loader.py
+            rm -rf chunks_out pack_chunks.py inject_loader.py
 
             (
               cd site_root
@@ -677,8 +680,12 @@ jobs:
 
               git add -A
               git commit -m "Deploy $SLUG" || true
-              git push origin gh-pages
-            )
+              if ! git push origin gh-pages; then
+                git reset --hard origin/gh-pages || true
+                gh release delete "$TAG" --yes --cleanup-tag || true
+                exit 1
+              fi
+            ) || notify_tg "⚠️ Failed & Skipped: $ARCHIVE (Git push rejected)"
           done
 
           notify_tg "✅ Batch Build Finished! Send /status to view ready game links & storage."
