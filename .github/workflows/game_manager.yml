@@ -145,13 +145,14 @@ jobs:
               -d "{\"chat_id\":\"${TG_CHAT}\",\"text\":\"🗑️ Removed requested game(s) & freed storage! Send /status to verify.\"}" >/dev/null
           fi
 
-      - name: Install Tools, rpatool & Official Ren'Py SDK
+      - name: Install Tools, rpatool, unrpyc, ffmpeg & Official Ren'Py SDK
         if: ${{ github.event.inputs.target_archive != 'LIST' && github.event.inputs.target_archive != 'list' && github.event.inputs.target_archive != 'STATUS' && github.event.inputs.target_archive != 'status' && !startsWith(github.event.inputs.target_archive, 'DELETE:') && !startsWith(github.event.inputs.target_archive, 'delete:') }}
         run: |
           sudo apt-get update
-          sudo apt-get install -y p7zip-full unrar wget zip unzip python3 tar bzip2
+          sudo apt-get install -y p7zip-full unrar wget zip unzip python3 tar bzip2 ffmpeg xvfb git
           wget -q "https://raw.githubusercontent.com/Shizmob/rpatool/master/rpatool" -O /usr/local/bin/rpatool
           chmod +x /usr/local/bin/rpatool
+          git clone --depth 1 https://github.com/CensoredUsername/unrpyc.git /opt/unrpyc
 
           RENPY_VER="8.3.4"
           wget -q "https://www.renpy.org/dl/${RENPY_VER}/renpy-${RENPY_VER}-sdk.tar.bz2"
@@ -166,7 +167,7 @@ jobs:
           cp -r "$WEB_INNER"/* renpy_sdk/web/
           rm -rf temp_web "renpy-${RENPY_VER}-web.zip"
 
-      - name: Build Selected Games into 45MB Natural-Ordered Chunks & Deploy
+      - name: Build Selected Games into 12MB Zero-Blur Chunks & Deploy
         if: ${{ github.event.inputs.target_archive != 'LIST' && github.event.inputs.target_archive != 'list' && github.event.inputs.target_archive != 'STATUS' && github.event.inputs.target_archive != 'status' && !startsWith(github.event.inputs.target_archive, 'DELETE:') && !startsWith(github.event.inputs.target_archive, 'delete:') }}
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
@@ -249,14 +250,46 @@ jobs:
               rm -f "$rpa"
             done
 
+            # Auto-decompile legacy Ren'Py 7/8 .rpyc/.rpymc files to .rpy
+            python3 /opt/unrpyc/unrpyc.py -c game_src/game/ || true
+            find game_src/game \( -name "*.rpyc" -o -name "*.rpymc" \) -delete
+
+            # Transcode ALL videos (.mkv/.mp4/.avi/.mov/.ogv/.webm) into browser-safe VP8+Vorbis WebM with guaranteed stereo audio
+            find game_src/game -type f \( -iname "*.mkv" -o -iname "*.mp4" -o -iname "*.avi" -o -iname "*.mov" -o -iname "*.ogv" -o -iname "*.webm" \) | while read -r vid; do
+              echo "Transcoding video to browser-safe VP8/Vorbis: $vid"
+              if ffmpeg -nostdin -y -i "$vid" -f lavfi -i anullsrc=channel_layout=stereo:sample_rate=44100 \
+                -map 0:v:0 -map 0:a:0? -map 1:a:0 -shortest \
+                -c:v libvpx -crf 28 -b:v 1500k -deadline realtime -cpu-used 4 \
+                -c:a libvorbis -ar 44100 -ac 2 "${vid}.fixed.webm" >/dev/null 2>&1; then
+                mv "${vid}.fixed.webm" "$vid"
+              else
+                rm -f "${vid}.fixed.webm"
+              fi
+            done
+
+            # Keep ONLY scripts and fonts in game.zip; stream all media cleanly without blurred placeholders
             python3 -c 'open("game_src/game/progressive_download.txt", "w").write("- game/**.rpy\n- game/**.rpyc\n- game/**.rpyb\n- game/**.ttf\n- game/**.otf\n+ game/**\n")'
 
-            if ! ./renpy_sdk/renpy.sh ./renpy_sdk/launcher web_build game_src --destination web_out; then
+            if ! xvfb-run -a ./renpy_sdk/renpy.sh ./renpy_sdk/launcher web_build game_src --destination web_out; then
               notify_tg "⚠️ Failed & Skipped: $ARCHIVE (Ren'Py web_build error)"
               rm -rf game_src web_out
               continue
             fi
             rm -rf game_src
+
+            # Strip any Ren'Py auto-generated blurred placeholders from game.zip
+            python3 - << 'STRIPBLUR'
+          import zipfile, os
+          gzip_path = "web_out/game.zip"
+          if os.path.exists(gzip_path):
+              tmp_zip = gzip_path + ".clean"
+              with zipfile.ZipFile(gzip_path, 'r') as zin, zipfile.ZipFile(tmp_zip, 'w', zipfile.ZIP_DEFLATED) as zout:
+                  for item in zin.infolist():
+                      low = item.filename.lower()
+                      if not low.endswith(('.png', '.jpg', '.jpeg', '.webp', '.avif', '.webm', '.mp4', '.mkv', '.ogv', '.ogg', '.mp3', '.wav')):
+                          zout.writestr(item, zin.read(item.filename))
+              os.replace(tmp_zip, gzip_path)
+          STRIPBLUR
 
             if [ -f "web_out/game.zip" ]; then
               GZIP_SIZE=$(stat -c%s "web_out/game.zip")
@@ -273,7 +306,7 @@ jobs:
 
           prog_dir = "web_out/game"
           chunks_dir = "chunks_out"
-          MAX_CHUNK_BYTES = 45 * 1024 * 1024
+          MAX_CHUNK_BYTES = 12 * 1024 * 1024
 
           heavy_files = []
           if os.path.exists(prog_dir):
@@ -289,7 +322,7 @@ jobs:
 
           def priority_key(item):
               p = item[1].lower()
-              if any(k in p for k in ['/gui/', 'splash', 'menu', 'logo', 'black', 'idle', 'hover', '.ogg', '.mp3', '.webm', '.mp4', '.ogv']):
+              if any(k in p for k in ['/gui/', 'splash', 'menu', 'logo', 'black', 'idle', 'hover', '.ogg', '.mp3', '.webm', '.mp4', '.mkv', '.ogv']):
                   return (0, natural_tokens(p))
               if re.search(r'(ep|episode|ch|chapter|part|day|act)[-_ ]?0*1\b|prologue|intro', p):
                   return (1, natural_tokens(p))
@@ -331,7 +364,7 @@ jobs:
             python3 pack_chunks.py
 
             gh release delete "$TAG" --yes --cleanup-tag || true
-            gh release create "$TAG" --title "Progressive Stream: $SLUG" --notes "Lossless 45MB chunks"
+            gh release create "$TAG" --title "Progressive Stream: $SLUG" --notes "Lossless 12MB zero-blur chunks"
             if ls chunks_out/chunk_*.zip 1> /dev/null 2>&1; then
               if ! gh release upload "$TAG" chunks_out/chunk_*.zip; then
                 notify_tg "⚠️ Failed & Skipped: $ARCHIVE (GitHub Release upload error)"
@@ -371,7 +404,7 @@ jobs:
             const BASE_URL = __BASE_URL__;
             const MANIFEST = __MANIFEST__;
             const ALL_CHUNKS = __CHUNKS__;
-            const MAX_BUFFER_BYTES = 1024 * 1024 * 1024;
+            const MAX_BUFFER_BYTES = 768 * 1024 * 1024;
 
             let hud = null;
             function updateHud(text) {
@@ -384,7 +417,7 @@ jobs:
               hud.textContent = text;
               hud.style.opacity = '1';
               clearTimeout(hud._t);
-              hud._t = setTimeout(() => { if (hud) hud.style.opacity = '0.2'; }, 3000);
+              hud._t = setTimeout(() => { if (hud) hud.style.opacity = '0.2'; }, 2500);
             }
 
             const SUFFIX_MAP = new Map();
@@ -456,7 +489,7 @@ jobs:
               if (!isUrgent && activeUrgentCount > 0) return null;
 
               if (isUrgent) activeUrgentCount++;
-              updateHud(`${isUrgent ? 'Loading' : 'Preloading'} ${chunkName} (${Math.round(currentBufferBytes/1048576)}MB)...`);
+              updateHud(`${isUrgent ? 'Streaming' : 'Buffering'} ${chunkName}...`);
 
               const promise = (async () => {
                 try {
@@ -475,7 +508,7 @@ jobs:
                   const entry = { files: fileMap, size: totalSize, lastUsed: Date.now() };
                   fifoCache.set(chunkName, entry);
                   currentBufferBytes += totalSize;
-                  updateHud(`HD Ready (${chunkName}) | RAM: ${Math.round(currentBufferBytes/1048576)}MB / 1024MB`);
+                  updateHud(`HD Ready (${chunkName}) | RAM: ${Math.round(currentBufferBytes/1048576)}MB`);
                   return entry;
                 } finally {
                   if (isUrgent) activeUrgentCount = Math.max(0, activeUrgentCount - 1);
@@ -489,7 +522,7 @@ jobs:
                           if (activeUrgentCount > 0) break;
                           if (idx + offset >= ALL_CHUNKS.length) break;
                           const nextName = ALL_CHUNKS[idx + offset];
-                          if (!fifoCache.has(nextName) && !inflightChunks.has(nextName) && (currentBufferBytes + 60*1024*1024) <= MAX_BUFFER_BYTES) {
+                          if (!fifoCache.has(nextName) && !inflightChunks.has(nextName) && (currentBufferBytes + 20*1024*1024) <= MAX_BUFFER_BYTES) {
                             await loadChunk(nextName, false, 0).catch(() => {});
                           }
                         }
@@ -508,16 +541,7 @@ jobs:
               return entry ? (entry.files.get(info.key) || null) : null;
             }
 
-            const fsSyncTimer = setInterval(() => {
-              const FS = (window.Module && window.Module.FS) || window.FS;
-              if (FS) {
-                for (const entry of fifoCache.values()) {
-                  for (const [path, rec] of entry.files.entries()) writeToEmscriptenFS(path, rec.bytes);
-                }
-                clearInterval(fsSyncTimer);
-              }
-            }, 500);
-
+            // Preload initial Tier 0 chunks (GUI, Audio, WebM Videos) once on startup
             for (let i = 0; i < Math.min(3, ALL_CHUNKS.length); i++) {
               loadChunk(ALL_CHUNKS[i], false, 2).catch(() => {});
             }
@@ -564,53 +588,6 @@ jobs:
                 xhr.dispatchEvent(new Event('loadend'));
               });
             };
-
-            function patchMediaElement(el) {
-              const rawSrc = el.getAttribute('src') || el.src;
-              const info = resolveAsset(rawSrc);
-              if (!info || el._streamPatched) return;
-              el._streamPatched = true;
-              el.removeAttribute('src');
-              getAssetRecord(info).then(rec => {
-                if (rec) {
-                  el.src = URL.createObjectURL(new Blob([rec.bytes], { type: 'video/webm' }));
-                  const target = (el.tagName === 'SOURCE' && el.parentElement) ? el.parentElement : el;
-                  if (target.load) target.load();
-                  if (target.play) target.play().catch(() => {});
-                }
-              });
-            }
-
-            const mediaSrcDesc = Object.getOwnPropertyDescriptor(HTMLMediaElement.prototype, 'src');
-            if (mediaSrcDesc && mediaSrcDesc.set) {
-              Object.defineProperty(HTMLMediaElement.prototype, 'src', {
-                get: mediaSrcDesc.get,
-                set: function(val) {
-                  const info = resolveAsset(val);
-                  if (info) {
-                    const el = this;
-                    getAssetRecord(info).then(rec => {
-                      if (rec) {
-                        mediaSrcDesc.set.call(el, URL.createObjectURL(new Blob([rec.bytes], { type: 'video/webm' })));
-                        el.load(); el.play().catch(() => {});
-                      }
-                    });
-                    return;
-                  }
-                  mediaSrcDesc.set.call(this, val);
-                },
-                configurable: true
-              });
-            }
-
-            new MutationObserver(muts => {
-              for (const m of muts) {
-                for (const node of m.addedNodes) {
-                  if (node.tagName === 'VIDEO' || node.tagName === 'SOURCE') patchMediaElement(node);
-                  if (node.querySelectorAll) node.querySelectorAll('video, source').forEach(patchMediaElement);
-                }
-              }
-            }).observe(document.documentElement, { childList: true, subtree: true });
           })();
           </script>
           """
