@@ -179,7 +179,10 @@ jobs:
           notify_tg() {
             local MSG="$1"
             if [ -n "$TG_TOKEN" ] && [ -n "$TG_CHAT" ]; then
-              python3 -c 'import os, sys, urllib.request, json; urllib.request.urlopen(urllib.request.Request(f"https://api.telegram.org/bot{os.environ[\"TG_TOKEN\"]}/sendMessage", data=json.dumps({"chat_id": os.environ["TG_CHAT"], "text": sys.argv[1]}).encode(), headers={"Content-Type": "application/json"}))' "$MSG" || true
+              PAYLOAD=$(python3 -c 'import os, sys, json; print(json.dumps({"chat_id": os.environ["TG_CHAT"], "text": sys.argv[1]}))' "$MSG")
+              curl -s -X POST "https://api.telegram.org/bot${TG_TOKEN}/sendMessage" \
+                -H "Content-Type: application/json" \
+                -d "$PAYLOAD" >/dev/null || true
             fi
           }
 
@@ -286,7 +289,6 @@ jobs:
 
           def priority_key(item):
               p = item[1].lower()
-              # Tier 0: GUI, audio, AND all videos (.webm/.mp4/.ogv) so Emscripten FS pre-mounts them before C fopen()
               if any(k in p for k in ['/gui/', 'splash', 'menu', 'logo', 'black', 'idle', 'hover', '.ogg', '.mp3', '.webm', '.mp4', '.ogv']):
                   return (0, natural_tokens(p))
               if re.search(r'(ep|episode|ch|chapter|part|day|act)[-_ ]?0*1\b|prologue|intro', p):
@@ -516,7 +518,6 @@ jobs:
               }
             }, 500);
 
-            // Preload initial Tier 0 chunks (GUI, Audio, Videos) immediately
             for (let i = 0; i < Math.min(3, ALL_CHUNKS.length); i++) {
               loadChunk(ALL_CHUNKS[i], false, 2).catch(() => {});
             }
