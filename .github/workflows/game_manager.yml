@@ -424,6 +424,7 @@ jobs:
             fi
             rm -rf game_src trace_story.py web_build.log
 
+            # Keep ALL scripts, fonts, gui/, icons, and small UI images (<150KB) inside game.zip so boot NEVER fails!
             python3 - << 'SPLITZIP'
           import zipfile, os
           gzip_path = "web_out/game.zip"
@@ -436,7 +437,7 @@ jobs:
                       fn = item.filename.lstrip('/')
                       low = fn.lower()
                       is_media = low.endswith(('.png', '.jpg', '.jpeg', '.webp', '.avif', '.webm', '.mp4', '.mkv', '.ogv', '.ogg', '.mp3', '.wav'))
-                      is_core_ui = ('/gui/' in ('/' + low) or 'window_icon' in low or 'presplash' in low or 'splash' in low or 'logo' in low)
+                      is_core_ui = ('gui/' in low or 'icon' in low or 'presplash' in low or 'splash' in low or 'logo' in low or item.file_size < 153600)
                       if is_media and not is_core_ui:
                           dest_rel = fn if fn.startswith('game/') else ('game/' + fn)
                           dest_path = os.path.join("web_out", dest_rel)
@@ -529,9 +530,9 @@ jobs:
             rm -f script_order.json
 
             gh release delete "$TAG" --yes --cleanup-tag || true
-            gh release create "$TAG" --title "Progressive Stream: $SLUG" --notes "Script-ordered 12MB zero-blur chunks"
+            gh release create "$TAG" --title "Progressive Stream: $SLUG" --notes "Script-ordered 12MB zero-blur chunks" || true
             if ls chunks_out/chunk_*.zip 1> /dev/null 2>&1; then
-              if ! gh release upload "$TAG" chunks_out/chunk_*.zip; then
+              if ! gh release upload "$TAG" chunks_out/chunk_*.zip --clobber; then
                 notify_tg "⚠️ Failed & Skipped: $ARCHIVE (GitHub Release upload error)"
                 rm -rf web_out chunks_out pack_chunks.py
                 continue
