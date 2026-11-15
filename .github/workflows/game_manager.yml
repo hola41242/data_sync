@@ -145,7 +145,7 @@ jobs:
               -d "{\"chat_id\":\"${TG_CHAT}\",\"text\":\"🗑️ Removed requested game(s) & freed storage! Send /status to verify.\"}" >/dev/null
           fi
 
-      - name: Install Tools, Dual unrpyc (Py3 + Py2), ffmpeg & Ren'Py Web SDK
+      - name: Install Tools, Dual unrpyc (Py3 + Py2), ffmpeg & Ren'Py 8.5 Web SDK
         if: ${{ github.event.inputs.target_archive != 'LIST' && github.event.inputs.target_archive != 'list' && github.event.inputs.target_archive != 'STATUS' && github.event.inputs.target_archive != 'status' && !startsWith(github.event.inputs.target_archive, 'DELETE:') && !startsWith(github.event.inputs.target_archive, 'delete:') }}
         run: |
           sudo apt-get update
@@ -156,7 +156,7 @@ jobs:
           # 1) Modern unrpyc (Python 3 for Ren'Py 8.0 - 8.5)
           git clone --depth 1 https://github.com/CensoredUsername/unrpyc.git /opt/unrpyc_py3
 
-          # 2) Legacy unrpyc (Python 2 for Ren'Py 6/7 games like Guardians & Debauchery)
+          # 2) Legacy unrpyc (Python 2 for Ren'Py 6/7 games)
           git clone --depth 1 --branch legacy https://github.com/CensoredUsername/unrpyc.git /opt/unrpyc_py2 || git clone --depth 1 https://github.com/CensoredUsername/unrpyc.git /opt/unrpyc_py2
           RENPY7_VER="7.7.3"
           wget -q "https://www.renpy.org/dl/${RENPY7_VER}/renpy-${RENPY7_VER}-sdk.tar.bz2"
@@ -164,8 +164,8 @@ jobs:
           mv "renpy-${RENPY7_VER}-sdk" renpy7_sdk
           rm -f "renpy-${RENPY7_VER}-sdk.tar.bz2"
 
-          # 3) Official Ren'Py 8.3.4 Web Build SDK
-          RENPY_VER="8.3.4"
+          # 3) Latest Ren'Py 8.5.0 Web Build SDK (supports config.image_directories & all 8.x/7.x scripts)
+          RENPY_VER="8.5.0"
           wget -q "https://www.renpy.org/dl/${RENPY_VER}/renpy-${RENPY_VER}-sdk.tar.bz2"
           tar -xjf "renpy-${RENPY_VER}-sdk.tar.bz2"
           mv "renpy-${RENPY_VER}-sdk" renpy_sdk
@@ -186,6 +186,9 @@ jobs:
           TARGET: ${{ github.event.inputs.target_archive }}
           TG_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TG_CHAT: ${{ secrets.TELEGRAM_CHAT_ID }}
+          EDITOR: cat
+          VISUAL: cat
+          BROWSER: echo
         run: |
           set +e
           notify_tg() {
@@ -308,7 +311,6 @@ jobs:
               except Exception:
                   pass
 
-          # Map image/audio definitions to real file paths
           defined_assets = {}
           for lines in labels.values():
               for s in lines:
@@ -391,12 +393,12 @@ jobs:
           TRACEPY
             python3 trace_story.py || echo "{}" > script_order.json
 
-            # Transcode ALL videos (.mkv/.mp4/.avi/.mov/.ogv/.webm) into browser-safe VP8+Vorbis WebM with guaranteed stereo audio
-            find game_src/game -type f \( -iname "*.mkv" -o -iname "*.mp4" -o -iname "*.avi" -o -iname "*.mov" -o -iname "*.ogv" -o -iname "*.webm" \) | while read -r vid; do
-              echo "Transcoding video to browser-safe VP8/Vorbis: $vid"
+            # Transcode ONLY non-WebM videos (.mkv/.mp4/.avi/.mov/.ogv) OR audio-less .webm into browser-safe VP8/Vorbis
+            find game_src/game -type f \( -iname "*.mkv" -o -iname "*.mp4" -o -iname "*.avi" -o -iname "*.mov" -o -iname "*.ogv" \) | while read -r vid; do
+              echo "Transcoding non-WebM video: $vid"
               if ffmpeg -nostdin -y -i "$vid" -f lavfi -i anullsrc=channel_layout=stereo:sample_rate=44100 \
                 -map 0:v:0 -map 0:a:0? -map 1:a:0 -shortest \
-                -c:v libvpx -crf 28 -b:v 1500k -deadline realtime -cpu-used 4 \
+                -c:v libvpx -crf 28 -b:v 1500k -deadline realtime -cpu-used 6 \
                 -c:a libvorbis -ar 44100 -ac 2 "${vid}.fixed.webm" >/dev/null 2>&1; then
                 mv "${vid}.fixed.webm" "$vid"
               else
@@ -404,17 +406,28 @@ jobs:
               fi
             done
 
-            # Keep ONLY scripts and fonts in game.zip; stream all media cleanly without blurred placeholders
+            # Fast stream-copy silent audio into audio-less .webm files (takes <0.05s per file, no video re-encode)
+            find game_src/game -type f -iname "*.webm" | while read -r wvid; do
+              HAS_AUDIO=$(ffprobe -v error -select_streams a -show_entries stream=codec_type -of csv=p=0 "$wvid" 2>/dev/null)
+              if [ -z "$HAS_AUDIO" ]; then
+                if ffmpeg -nostdin -y -i "$wvid" -f lavfi -i anullsrc=channel_layout=stereo:sample_rate=44100 \
+                  -map 0:v:0 -map 1:a:0 -shortest -c:v copy -c:a libvorbis -ar 44100 -ac 2 "${wvid}.aud.webm" >/dev/null 2>&1; then
+                  mv "${wvid}.aud.webm" "$wvid"
+                else
+                  rm -f "${wvid}.aud.webm"
+                fi
+              fi
+            done
+
             python3 -c 'open("game_src/game/progressive_download.txt", "w").write("- game/**.rpy\n- game/**.rpyc\n- game/**.rpyb\n- game/**.ttf\n- game/**.otf\n+ game/**\n")'
 
-            if ! xvfb-run -a ./renpy_sdk/renpy.sh ./renpy_sdk/launcher web_build game_src --destination web_out; then
+            if ! timeout 15m xvfb-run -a ./renpy_sdk/renpy.sh ./renpy_sdk/launcher web_build game_src --destination web_out </dev/null; then
               notify_tg "⚠️ Failed & Skipped: $ARCHIVE (Ren'Py web_build error)"
               rm -rf game_src web_out script_order.json trace_story.py
               continue
             fi
             rm -rf game_src trace_story.py
 
-            # Strip any Ren'Py auto-generated blurred placeholders from game.zip
             python3 - << 'STRIPBLUR'
           import zipfile, os
           gzip_path = "web_out/game.zip"
@@ -466,13 +479,10 @@ jobs:
 
           def priority_key(item):
               p = item[1].lower()
-              # Tier 0: GUI, menus, splash, fonts/audio UI
               if any(k in p for k in ['/gui/', 'splash', 'menu', 'logo', 'black', 'idle', 'hover']):
                   return (0, 0, natural_tokens(p))
-              # Tier 1: Exact story execution sequence traced from 'label start:'
               if p in rank_map:
                   return (1, rank_map[p], natural_tokens(p))
-              # Tier 2: Untraced assets in natural episode/chapter order
               return (2, 0, natural_tokens(p))
 
           heavy_files.sort(key=priority_key)
@@ -689,7 +699,6 @@ jobs:
               return entry ? (entry.files.get(info.key) || null) : null;
             }
 
-            // Preload initial 3 story-ordered chunks (~36MB = ~150-200 opening scenes) on startup
             for (let i = 0; i < Math.min(3, ALL_CHUNKS.length); i++) {
               loadChunk(ALL_CHUNKS[i], false, 3).catch(() => {});
             }
