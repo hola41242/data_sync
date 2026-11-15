@@ -145,15 +145,26 @@ jobs:
               -d "{\"chat_id\":\"${TG_CHAT}\",\"text\":\"🗑️ Removed requested game(s) & freed storage! Send /status to verify.\"}" >/dev/null
           fi
 
-      - name: Install Tools, rpatool, unrpyc, ffmpeg & Official Ren'Py SDK
+      - name: Install Tools, Dual unrpyc (Py3 + Py2), ffmpeg & Ren'Py Web SDK
         if: ${{ github.event.inputs.target_archive != 'LIST' && github.event.inputs.target_archive != 'list' && github.event.inputs.target_archive != 'STATUS' && github.event.inputs.target_archive != 'status' && !startsWith(github.event.inputs.target_archive, 'DELETE:') && !startsWith(github.event.inputs.target_archive, 'delete:') }}
         run: |
           sudo apt-get update
           sudo apt-get install -y p7zip-full unrar wget zip unzip python3 tar bzip2 ffmpeg xvfb git
           wget -q "https://raw.githubusercontent.com/Shizmob/rpatool/master/rpatool" -O /usr/local/bin/rpatool
           chmod +x /usr/local/bin/rpatool
-          git clone --depth 1 https://github.com/CensoredUsername/unrpyc.git /opt/unrpyc
 
+          # 1) Modern unrpyc (Python 3 for Ren'Py 8.0 - 8.5)
+          git clone --depth 1 https://github.com/CensoredUsername/unrpyc.git /opt/unrpyc_py3
+
+          # 2) Legacy unrpyc (Python 2 for Ren'Py 6/7 games like Guardians & Debauchery)
+          git clone --depth 1 --branch legacy https://github.com/CensoredUsername/unrpyc.git /opt/unrpyc_py2 || git clone --depth 1 https://github.com/CensoredUsername/unrpyc.git /opt/unrpyc_py2
+          RENPY7_VER="7.7.3"
+          wget -q "https://www.renpy.org/dl/${RENPY7_VER}/renpy-${RENPY7_VER}-sdk.tar.bz2"
+          tar -xjf "renpy-${RENPY7_VER}-sdk.tar.bz2"
+          mv "renpy-${RENPY7_VER}-sdk" renpy7_sdk
+          rm -f "renpy-${RENPY7_VER}-sdk.tar.bz2"
+
+          # 3) Official Ren'Py 8.3.4 Web Build SDK
           RENPY_VER="8.3.4"
           wget -q "https://www.renpy.org/dl/${RENPY_VER}/renpy-${RENPY_VER}-sdk.tar.bz2"
           tar -xjf "renpy-${RENPY_VER}-sdk.tar.bz2"
@@ -167,7 +178,7 @@ jobs:
           cp -r "$WEB_INNER"/* renpy_sdk/web/
           rm -rf temp_web "renpy-${RENPY_VER}-web.zip"
 
-      - name: Build Selected Games into 12MB Zero-Blur Chunks & Deploy
+      - name: Build Selected Games into Script-Ordered 12MB Zero-Blur Chunks & Deploy
         if: ${{ github.event.inputs.target_archive != 'LIST' && github.event.inputs.target_archive != 'list' && github.event.inputs.target_archive != 'STATUS' && github.event.inputs.target_archive != 'status' && !startsWith(github.event.inputs.target_archive, 'DELETE:') && !startsWith(github.event.inputs.target_archive, 'delete:') }}
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
@@ -219,7 +230,7 @@ jobs:
             fi
 
             echo "=== Building $ARCHIVE -> /$SLUG/ ==="
-            rm -rf raw_extract game_src web_out chunks_out
+            rm -rf raw_extract game_src web_out chunks_out script_order.json
             mkdir -p raw_extract game_src web_out chunks_out
 
             if ! rclone copyto "gdrive:Games/${ARCHIVE}" "./${ARCHIVE}" --multi-thread-streams 8 --drive-chunk-size 128M -P; then
@@ -245,14 +256,140 @@ jobs:
             cp -a "$RENPY_ROOT"/. game_src/
             rm -rf raw_extract
 
+            # Unpack all .rpa archives
             find game_src/game -name "*.rpa" | sort | while read -r rpa; do
               python3 /usr/local/bin/rpatool -x "$rpa" -o game_src/game/ || true
               rm -f "$rpa"
             done
 
-            # Auto-decompile legacy Ren'Py 7/8 .rpyc/.rpymc files to .rpy
-            python3 /opt/unrpyc/unrpyc.py -c game_src/game/ || true
+            # Dual unrpyc: Step A (Py3 for Ren'Py 8.x), Step B (Ren'Py 7.7.3 Py2 for legacy Ren'Py 6/7)
+            python3 /opt/unrpyc_py3/unrpyc.py -c game_src/game/ >/dev/null 2>&1 || true
+            PY2_BIN=$(find renpy7_sdk/lib -name "python" -type f | head -n 1)
+            if [ -n "$PY2_BIN" ]; then
+              "$PY2_BIN" /opt/unrpyc_py2/unrpyc.py -c game_src/game/ >/dev/null 2>&1 || true
+            fi
             find game_src/game \( -name "*.rpyc" -o -name "*.rpymc" \) -delete
+
+            # Trace exact story execution order from 'label start:' across jump/call graph
+            cat << 'TRACEPY' > trace_story.py
+          import os, re, json
+
+          game_dir = "game_src/game"
+          labels = {}
+          label_order = []
+          cur_label = "__top__"
+          labels[cur_label] = []
+
+          def natural_key(s):
+              return [int(t) if t.isdigit() else t for t in re.split(r'(\d+)', s.lower())]
+
+          rpy_files = []
+          for root, _, files in os.walk(game_dir):
+              for f in files:
+                  if f.endswith(".rpy"):
+                      rpy_files.append(os.path.join(root, f))
+          rpy_files.sort(key=natural_key)
+
+          for path in rpy_files:
+              try:
+                  with open(path, "r", encoding="utf-8", errors="ignore") as fh:
+                      for line in fh:
+                          s = line.strip()
+                          if not s or s.startswith("#"):
+                              continue
+                          m_lbl = re.match(r'^label\s+([a-zA-Z0-9_]+)\s*:', s)
+                          if m_lbl:
+                              cur_label = m_lbl.group(1)
+                              if cur_label not in labels:
+                                  labels[cur_label] = []
+                                  label_order.append(cur_label)
+                              continue
+                          labels.setdefault(cur_label, []).append(s)
+              except Exception:
+                  pass
+
+          # Map image/audio definitions to real file paths
+          defined_assets = {}
+          for lines in labels.values():
+              for s in lines:
+                  m_def = re.match(r'^(?:image|define)\s+([a-zA-Z0-9_ .-]+?)\s*=\s*["\']([^"\']+\.(?:webp|png|jpg|jpeg|avif|webm|mp4|mkv|ogv|ogg|mp3|wav))["\']', s, re.I)
+                  if m_def:
+                      defined_assets[m_def.group(1).strip().lower()] = m_def.group(2).replace("\\", "/").lower()
+
+          all_media = []
+          for root, _, files in os.walk(game_dir):
+              for f in files:
+                  if f.lower().endswith(('.webp', '.png', '.jpg', '.jpeg', '.avif', '.webm', '.mp4', '.mkv', '.ogv', '.ogg', '.mp3', '.wav')):
+                      rel = os.path.relpath(os.path.join(root, f), game_dir).replace("\\", "/").lower()
+                      all_media.append(rel)
+
+          by_stem = {}
+          for rel in all_media:
+              stem = os.path.splitext(os.path.basename(rel))[0].lower()
+              by_stem.setdefault(stem, []).append(rel)
+              norm = re.sub(r'[^a-z0-9]+', ' ', stem).strip()
+              by_stem.setdefault(norm, []).append(rel)
+
+          ordered_assets = []
+          seen_assets = set()
+
+          def add_rel(rel):
+              if rel not in seen_assets:
+                  seen_assets.add(rel)
+                  ordered_assets.append("game/" + rel)
+
+          def resolve_token(tok):
+              tok = tok.strip().strip('"\'').replace("\\", "/").lower()
+              if not tok:
+                  return
+              if tok in defined_assets:
+                  tok = defined_assets[tok]
+              for rel in all_media:
+                  if rel == tok or rel.endswith("/" + tok):
+                      add_rel(rel)
+              norm = re.sub(r'[^a-z0-9]+', ' ', os.path.splitext(os.path.basename(tok))[0]).strip()
+              for rel in by_stem.get(norm, []):
+                  add_rel(rel)
+
+          visited_labels = set()
+          queue = ["start"] if "start" in labels else []
+          for lbl in label_order:
+              if lbl not in queue:
+                  queue.append(lbl)
+          if "__top__" not in queue:
+              queue.append("__top__")
+
+          idx = 0
+          while idx < len(queue):
+              lbl = queue[idx]
+              idx += 1
+              if lbl in visited_labels or lbl not in labels:
+                  continue
+              visited_labels.add(lbl)
+              next_jumps = []
+              for s in labels[lbl]:
+                  for m_q in re.findall(r'["\']([^"\']+\.(?:webp|png|jpg|jpeg|avif|webm|mp4|mkv|ogv|ogg|mp3|wav))["\']', s, re.I):
+                      resolve_token(m_q)
+                  m_sc = re.match(r'^(?:scene|show)\s+([a-zA-Z0-9_ .-]+?)(?:\s+(?:at|with|as|behind|onlayer|zorder)\b|:|$)', s)
+                  if m_sc:
+                      resolve_token(m_sc.group(1))
+                  m_pl = re.match(r'^(?:play|queue)\s+(?:music|sound|voice|audio)\s+["\']?([^"\'\n]+)', s)
+                  if m_pl:
+                      resolve_token(m_pl.group(1))
+                  m_jc = re.match(r'^(?:jump|call)\s+(?:expression\s+)?([a-zA-Z0-9_]+)', s)
+                  if m_jc:
+                      target_lbl = m_jc.group(1)
+                      if target_lbl in labels and target_lbl not in visited_labels:
+                          next_jumps.append(target_lbl)
+              if next_jumps:
+                  queue[idx:idx] = next_jumps
+
+          rank_map = {path: i for i, path in enumerate(ordered_assets)}
+          with open("script_order.json", "w", encoding="utf-8") as out:
+              json.dump(rank_map, out)
+          print(f"Traced {len(rank_map)} story assets in chronological execution order.")
+          TRACEPY
+            python3 trace_story.py || echo "{}" > script_order.json
 
             # Transcode ALL videos (.mkv/.mp4/.avi/.mov/.ogv/.webm) into browser-safe VP8+Vorbis WebM with guaranteed stereo audio
             find game_src/game -type f \( -iname "*.mkv" -o -iname "*.mp4" -o -iname "*.avi" -o -iname "*.mov" -o -iname "*.ogv" -o -iname "*.webm" \) | while read -r vid; do
@@ -272,10 +409,10 @@ jobs:
 
             if ! xvfb-run -a ./renpy_sdk/renpy.sh ./renpy_sdk/launcher web_build game_src --destination web_out; then
               notify_tg "⚠️ Failed & Skipped: $ARCHIVE (Ren'Py web_build error)"
-              rm -rf game_src web_out
+              rm -rf game_src web_out script_order.json trace_story.py
               continue
             fi
-            rm -rf game_src
+            rm -rf game_src trace_story.py
 
             # Strip any Ren'Py auto-generated blurred placeholders from game.zip
             python3 - << 'STRIPBLUR'
@@ -296,7 +433,7 @@ jobs:
               if [ "$GZIP_SIZE" -gt 99614720 ]; then
                 GZIP_MB=$((GZIP_SIZE / 1048576))
                 notify_tg "⚠️ Failed & Skipped: $ARCHIVE (game.zip is ${GZIP_MB}MB > 95MB GitHub file limit)"
-                rm -rf web_out chunks_out
+                rm -rf web_out chunks_out script_order.json
                 continue
               fi
             fi
@@ -307,6 +444,13 @@ jobs:
           prog_dir = "web_out/game"
           chunks_dir = "chunks_out"
           MAX_CHUNK_BYTES = 12 * 1024 * 1024
+
+          rank_map = {}
+          if os.path.exists("script_order.json"):
+              try:
+                  rank_map = json.load(open("script_order.json", "r", encoding="utf-8"))
+              except Exception:
+                  rank_map = {}
 
           heavy_files = []
           if os.path.exists(prog_dir):
@@ -322,11 +466,14 @@ jobs:
 
           def priority_key(item):
               p = item[1].lower()
-              if any(k in p for k in ['/gui/', 'splash', 'menu', 'logo', 'black', 'idle', 'hover', '.ogg', '.mp3', '.webm', '.mp4', '.mkv', '.ogv']):
-                  return (0, natural_tokens(p))
-              if re.search(r'(ep|episode|ch|chapter|part|day|act)[-_ ]?0*1\b|prologue|intro', p):
-                  return (1, natural_tokens(p))
-              return (2, natural_tokens(p))
+              # Tier 0: GUI, menus, splash, fonts/audio UI
+              if any(k in p for k in ['/gui/', 'splash', 'menu', 'logo', 'black', 'idle', 'hover']):
+                  return (0, 0, natural_tokens(p))
+              # Tier 1: Exact story execution sequence traced from 'label start:'
+              if p in rank_map:
+                  return (1, rank_map[p], natural_tokens(p))
+              # Tier 2: Untraced assets in natural episode/chapter order
+              return (2, 0, natural_tokens(p))
 
           heavy_files.sort(key=priority_key)
 
@@ -362,9 +509,10 @@ jobs:
           PYSCRIPT
 
             python3 pack_chunks.py
+            rm -f script_order.json
 
             gh release delete "$TAG" --yes --cleanup-tag || true
-            gh release create "$TAG" --title "Progressive Stream: $SLUG" --notes "Lossless 12MB zero-blur chunks"
+            gh release create "$TAG" --title "Progressive Stream: $SLUG" --notes "Script-ordered 12MB zero-blur chunks"
             if ls chunks_out/chunk_*.zip 1> /dev/null 2>&1; then
               if ! gh release upload "$TAG" chunks_out/chunk_*.zip; then
                 notify_tg "⚠️ Failed & Skipped: $ARCHIVE (GitHub Release upload error)"
@@ -479,7 +627,7 @@ jobs:
 
             const origFetch = window.fetch.bind(window);
 
-            async function loadChunk(chunkName, isUrgent = false, preloadAhead = 2) {
+            async function loadChunk(chunkName, isUrgent = false, preloadAhead = 3) {
               if (fifoCache.has(chunkName)) {
                 const entry = fifoCache.get(chunkName);
                 entry.lastUsed = Date.now();
@@ -537,13 +685,13 @@ jobs:
             }
 
             async function getAssetRecord(info) {
-              const entry = await loadChunk(info.chunk, true, 2);
+              const entry = await loadChunk(info.chunk, true, 3);
               return entry ? (entry.files.get(info.key) || null) : null;
             }
 
-            // Preload initial Tier 0 chunks (GUI, Audio, WebM Videos) once on startup
+            // Preload initial 3 story-ordered chunks (~36MB = ~150-200 opening scenes) on startup
             for (let i = 0; i < Math.min(3, ALL_CHUNKS.length); i++) {
-              loadChunk(ALL_CHUNKS[i], false, 2).catch(() => {});
+              loadChunk(ALL_CHUNKS[i], false, 3).catch(() => {});
             }
 
             window.fetch = async function(resource, init) {
