@@ -230,16 +230,16 @@ jobs:
             fi
 
             echo "=== Building $ARCHIVE -> /$SLUG/ ==="
-            rm -rf raw_extract game_src web_out chunks_out script_order.json
+            rm -rf raw_extract game_src web_out chunks_out script_order.json web_build.log
             mkdir -p raw_extract game_src web_out chunks_out
 
-            if ! rclone copyto "gdrive:Games/${ARCHIVE}" "./${ARCHIVE}" --multi-thread-streams 8 --drive-chunk-size 128M -P; then
+            if ! rclone copyto "gdrive:Games/${ARCHIVE}" "./${ARCHIVE}" --multi-thread-streams 8 --drive-chunk-size 128M; then
               notify_tg "⚠️ Failed & Skipped: $ARCHIVE (Google Drive download error)"
               rm -f "${ARCHIVE}"
               continue
             fi
 
-            if ! (7z x "${ARCHIVE}" -oraw_extract -y || unrar x -y "${ARCHIVE}" raw_extract/); then
+            if ! (7z x "${ARCHIVE}" -oraw_extract -y >/dev/null || unrar x -y "${ARCHIVE}" raw_extract/ >/dev/null); then
               notify_tg "⚠️ Failed & Skipped: $ARCHIVE (Archive extraction error)"
               rm -rf "${ARCHIVE}" raw_extract
               continue
@@ -387,8 +387,8 @@ jobs:
           TRACEPY
             python3 trace_story.py || echo "{}" > script_order.json
 
+            echo "Normalizing non-WebM & audio-less videos..."
             find game_src/game -type f \( -iname "*.mkv" -o -iname "*.mp4" -o -iname "*.avi" -o -iname "*.mov" -o -iname "*.ogv" \) | while read -r vid; do
-              echo "Transcoding non-WebM video: $vid"
               if ffmpeg -nostdin -y -i "$vid" -f lavfi -i anullsrc=channel_layout=stereo:sample_rate=44100 \
                 -map 0:v:0 -map 0:a:0? -map 1:a:0 -shortest \
                 -c:v libvpx -crf 28 -b:v 1500k -deadline realtime -cpu-used 6 \
@@ -411,18 +411,19 @@ jobs:
               fi
             done
 
-            # DO NOT use progressive_download.txt so Ren'Py NEVER generates blurred placeholders!
             rm -f game_src/game/progressive_download.txt
 
-            if ! timeout 15m xvfb-run -a ./renpy_sdk/renpy.sh ./renpy_sdk/launcher web_build game_src --destination web_out </dev/null; then
-              notify_tg "⚠️ Failed & Skipped: $ARCHIVE (Ren'Py web_build error)"
-              rm -rf game_src web_out script_order.json trace_story.py
+            echo "Running Ren'Py web_build (up to 45m)..."
+            if ! timeout 45m xvfb-run -a ./renpy_sdk/renpy.sh ./renpy_sdk/launcher web_build game_src --destination web_out </dev/null >web_build.log 2>&1; then
+              ERR_TAIL=$(grep -v "Creating package" web_build.log | tail -n 5)
+              echo "=== WEB_BUILD FAILED LOG ==="
+              grep -v "Creating package" web_build.log | tail -n 40
+              notify_tg "⚠️ Failed & Skipped: $ARCHIVE (Ren'Py web_build error): $ERR_TAIL"
+              rm -rf game_src web_out script_order.json trace_story.py web_build.log
               continue
             fi
-            rm -rf game_src trace_story.py
+            rm -rf game_src trace_story.py web_build.log
 
-            # Extract heavy scene/character/video/audio media out of web_out/game.zip into web_out/game/,
-            # while keeping ALL scripts, fonts, gui/ and window_icon intact inside game.zip!
             python3 - << 'SPLITZIP'
           import zipfile, os
           gzip_path = "web_out/game.zip"
