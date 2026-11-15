@@ -411,8 +411,8 @@ jobs:
               fi
             done
 
-            # Keep scripts, fonts, AND game/gui/** in game.zip; stream all scene/CG/audio/video media cleanly
-            python3 -c 'open("game_src/game/progressive_download.txt", "w").write("- game/**.rpy\n- game/**.rpyc\n- game/**.rpyb\n- game/**.ttf\n- game/**.otf\n- game/gui/**\n+ game/**\n")'
+            # DO NOT use progressive_download.txt so Ren'Py NEVER generates blurred placeholders!
+            rm -f game_src/game/progressive_download.txt
 
             if ! timeout 15m xvfb-run -a ./renpy_sdk/renpy.sh ./renpy_sdk/launcher web_build game_src --destination web_out </dev/null; then
               notify_tg "⚠️ Failed & Skipped: $ARCHIVE (Ren'Py web_build error)"
@@ -421,19 +421,31 @@ jobs:
             fi
             rm -rf game_src trace_story.py
 
-            # Strip blurred scene/character placeholders from game.zip while preserving game/gui/ so boot never fails
-            python3 - << 'STRIPBLUR'
+            # Extract heavy scene/character/video/audio media out of web_out/game.zip into web_out/game/,
+            # while keeping ALL scripts, fonts, gui/ and window_icon intact inside game.zip!
+            python3 - << 'SPLITZIP'
           import zipfile, os
           gzip_path = "web_out/game.zip"
           if os.path.exists(gzip_path):
               tmp_zip = gzip_path + ".clean"
               with zipfile.ZipFile(gzip_path, 'r') as zin, zipfile.ZipFile(tmp_zip, 'w', zipfile.ZIP_DEFLATED) as zout:
                   for item in zin.infolist():
-                      low = item.filename.lower()
-                      if low.startswith('game/gui/') or not low.endswith(('.png', '.jpg', '.jpeg', '.webp', '.avif', '.webm', '.mp4', '.mkv', '.ogv', '.ogg', '.mp3', '.wav')):
+                      if item.is_dir():
+                          continue
+                      fn = item.filename.lstrip('/')
+                      low = fn.lower()
+                      is_media = low.endswith(('.png', '.jpg', '.jpeg', '.webp', '.avif', '.webm', '.mp4', '.mkv', '.ogv', '.ogg', '.mp3', '.wav'))
+                      is_core_ui = ('/gui/' in ('/' + low) or 'window_icon' in low or 'presplash' in low or 'splash' in low or 'logo' in low)
+                      if is_media and not is_core_ui:
+                          dest_rel = fn if fn.startswith('game/') else ('game/' + fn)
+                          dest_path = os.path.join("web_out", dest_rel)
+                          os.makedirs(os.path.dirname(dest_path), exist_ok=True)
+                          with open(dest_path, "wb") as out_f:
+                              out_f.write(zin.read(item.filename))
+                      else:
                           zout.writestr(item, zin.read(item.filename))
               os.replace(tmp_zip, gzip_path)
-          STRIPBLUR
+          SPLITZIP
 
             if [ -f "web_out/game.zip" ]; then
               GZIP_SIZE=$(stat -c%s "web_out/game.zip")
@@ -473,7 +485,7 @@ jobs:
 
           def priority_key(item):
               p = item[1].lower()
-              if any(k in p for k in ['splash', 'menu', 'logo', 'black', 'idle', 'hover']):
+              if any(k in p for k in ['menu', 'black', 'idle', 'hover']):
                   return (0, 0, natural_tokens(p))
               if p in rank_map:
                   return (1, rank_map[p], natural_tokens(p))
