@@ -424,8 +424,8 @@ jobs:
             fi
             rm -rf game_src trace_story.py web_build.log
 
-            # Extract ALL videos (strictly NEVER in game.zip) + heavy scene images/audio into chunks;
-            # keep scripts, fonts, gui/, icons, and small UI images inside game.zip
+            # Extract ALL videos & media into chunks (no 150KB exception so massive games stay <30MB game.zip),
+            # keeping ONLY scripts, fonts, gui/, icon, and presplash inside game.zip
             python3 - << 'SPLITZIP'
           import zipfile, os
           gzip_path = "web_out/game.zip"
@@ -439,7 +439,7 @@ jobs:
                       low = fn.lower()
                       is_video = low.endswith(('.webm', '.mp4', '.mkv', '.ogv', '.avi', '.mov'))
                       is_media = low.endswith(('.png', '.jpg', '.jpeg', '.webp', '.avif', '.ogg', '.mp3', '.wav'))
-                      is_core_ui = ('gui/' in low or 'icon' in low or 'presplash' in low or item.file_size < 153600)
+                      is_core_ui = ('gui/' in low or 'window_icon' in low or 'presplash' in low)
                       if is_video or (is_media and not is_core_ui):
                           dest_rel = fn if fn.startswith('game/') else ('game/' + fn)
                           dest_path = os.path.join("web_out", dest_rel)
@@ -648,7 +648,7 @@ jobs:
 
             const origFetch = window.fetch.bind(window);
 
-            async function loadChunk(chunkName, isUrgent = false, preloadAhead = 2) {
+            async function loadChunk(chunkName, isUrgent = false, preloadAhead = 4) {
               if (fifoCache.has(chunkName)) {
                 const entry = fifoCache.get(chunkName);
                 entry.lastUsed = Date.now();
@@ -708,7 +708,7 @@ jobs:
             }
 
             async function getAssetRecord(info) {
-              const entry = await loadChunk(info.chunk, true, 2);
+              const entry = await loadChunk(info.chunk, true, 4);
               return entry ? (entry.files.get(info.key) || null) : null;
             }
 
@@ -721,21 +721,23 @@ jobs:
               return bUrl;
             }
 
-            // Intercept HTML5 <video>/<audio> src & load() so Ren'Py Web videos play from Blob URLs without 404
             const mediaProto = HTMLMediaElement.prototype;
             const origSrcDesc = Object.getOwnPropertyDescriptor(mediaProto, 'src');
             const origSetAttr = Element.prototype.setAttribute;
             const origMediaLoad = mediaProto.load;
+            const origAppendChild = Node.prototype.appendChild;
 
             function patchMediaElement(el, rawVal) {
               const info = resolveAsset(rawVal);
               if (!info) return false;
-              el._pendingStreamInfo = info;
+              const target = (el instanceof HTMLSourceElement && el.parentElement) ? el.parentElement : el;
+              target._pendingStreamInfo = info;
               getVideoBlobUrl(info).then(bUrl => {
-                if (bUrl && el._pendingStreamInfo === info) {
-                  origSrcDesc.set.call(el, bUrl);
-                  origMediaLoad.call(el);
-                  el.play().catch(() => {});
+                if (bUrl && target._pendingStreamInfo === info) {
+                  if (el instanceof HTMLSourceElement) origSrcDesc.set.call(el, bUrl);
+                  origSrcDesc.set.call(target, bUrl);
+                  origMediaLoad.call(target);
+                  target.play().catch(() => {});
                 }
               });
               return true;
@@ -754,10 +756,18 @@ jobs:
 
             Element.prototype.setAttribute = function(name, val) {
               if ((this instanceof HTMLMediaElement || this instanceof HTMLSourceElement) && name.toLowerCase() === 'src') {
-                const targetMedia = (this instanceof HTMLSourceElement) ? this.parentElement : this;
-                if (targetMedia && patchMediaElement(targetMedia, val)) return;
+                if (patchMediaElement(this, val)) return;
               }
               return origSetAttr.apply(this, arguments);
+            };
+
+            Node.prototype.appendChild = function(child) {
+              const res = origAppendChild.apply(this, arguments);
+              if (child instanceof HTMLSourceElement) {
+                const raw = child.getAttribute('src') || child.src;
+                if (raw) patchMediaElement(child, raw);
+              }
+              return res;
             };
 
             mediaProto.load = function() {
@@ -766,8 +776,8 @@ jobs:
               return origMediaLoad.apply(this, arguments);
             };
 
-            for (let i = 0; i < Math.min(2, ALL_CHUNKS.length); i++) {
-              loadChunk(ALL_CHUNKS[i], false, 2).catch(() => {});
+            for (let i = 0; i < Math.min(4, ALL_CHUNKS.length); i++) {
+              loadChunk(ALL_CHUNKS[i], false, 4).catch(() => {});
             }
 
             window.fetch = async function(resource, init) {
