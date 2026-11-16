@@ -424,7 +424,8 @@ jobs:
             fi
             rm -rf game_src trace_story.py web_build.log
 
-            # Keep ALL scripts, fonts, gui/, icons, and small UI images (<150KB) inside game.zip so boot NEVER fails!
+            # Extract ALL videos (strictly NEVER in game.zip) + heavy scene images/audio into chunks;
+            # keep scripts, fonts, gui/, icons, and small UI images inside game.zip
             python3 - << 'SPLITZIP'
           import zipfile, os
           gzip_path = "web_out/game.zip"
@@ -436,9 +437,10 @@ jobs:
                           continue
                       fn = item.filename.lstrip('/')
                       low = fn.lower()
-                      is_media = low.endswith(('.png', '.jpg', '.jpeg', '.webp', '.avif', '.webm', '.mp4', '.mkv', '.ogv', '.ogg', '.mp3', '.wav'))
-                      is_core_ui = ('gui/' in low or 'icon' in low or 'presplash' in low or 'splash' in low or 'logo' in low or item.file_size < 153600)
-                      if is_media and not is_core_ui:
+                      is_video = low.endswith(('.webm', '.mp4', '.mkv', '.ogv', '.avi', '.mov'))
+                      is_media = low.endswith(('.png', '.jpg', '.jpeg', '.webp', '.avif', '.ogg', '.mp3', '.wav'))
+                      is_core_ui = ('gui/' in low or 'icon' in low or 'presplash' in low or item.file_size < 153600)
+                      if is_video or (is_media and not is_core_ui):
                           dest_rel = fn if fn.startswith('game/') else ('game/' + fn)
                           dest_path = os.path.join("web_out", dest_rel)
                           os.makedirs(os.path.dirname(dest_path), exist_ok=True)
@@ -487,7 +489,7 @@ jobs:
 
           def priority_key(item):
               p = item[1].lower()
-              if any(k in p for k in ['menu', 'black', 'idle', 'hover']):
+              if any(k in p for k in ['menu', 'black', 'idle', 'hover', 'logo']):
                   return (0, 0, natural_tokens(p))
               if p in rank_map:
                   return (1, rank_map[p], natural_tokens(p))
@@ -570,7 +572,7 @@ jobs:
             const BASE_URL = __BASE_URL__;
             const MANIFEST = __MANIFEST__;
             const ALL_CHUNKS = __CHUNKS__;
-            const MAX_BUFFER_BYTES = 768 * 1024 * 1024;
+            const MAX_BUFFER_BYTES = 512 * 1024 * 1024;
 
             let hud = null;
             function updateHud(text) {
@@ -620,6 +622,7 @@ jobs:
 
             const fifoCache = new Map();
             const inflightChunks = new Map();
+            const blobUrlCache = new Map();
             let currentBufferBytes = 0;
             let activeUrgentCount = 0;
 
@@ -645,7 +648,7 @@ jobs:
 
             const origFetch = window.fetch.bind(window);
 
-            async function loadChunk(chunkName, isUrgent = false, preloadAhead = 3) {
+            async function loadChunk(chunkName, isUrgent = false, preloadAhead = 2) {
               if (fifoCache.has(chunkName)) {
                 const entry = fifoCache.get(chunkName);
                 entry.lastUsed = Date.now();
@@ -668,7 +671,9 @@ jobs:
                     const slicedAb = data.buffer.slice(data.byteOffset, data.byteOffset + data.byteLength);
                     fileMap.set(path, { bytes: data, ab: slicedAb });
                     totalSize += data.byteLength;
-                    writeToEmscriptenFS(path, data);
+                    if (!path.match(/\\.(webm|mp4|mkv|ogv|avi|mov)$/i)) {
+                      writeToEmscriptenFS(path, data);
+                    }
                   }
                   evictIfNeeded(totalSize);
                   const entry = { files: fileMap, size: totalSize, lastUsed: Date.now() };
@@ -703,12 +708,66 @@ jobs:
             }
 
             async function getAssetRecord(info) {
-              const entry = await loadChunk(info.chunk, true, 3);
+              const entry = await loadChunk(info.chunk, true, 2);
               return entry ? (entry.files.get(info.key) || null) : null;
             }
 
-            for (let i = 0; i < Math.min(3, ALL_CHUNKS.length); i++) {
-              loadChunk(ALL_CHUNKS[i], false, 3).catch(() => {});
+            async function getVideoBlobUrl(info) {
+              if (blobUrlCache.has(info.key)) return blobUrlCache.get(info.key);
+              const rec = await getAssetRecord(info);
+              if (!rec) return null;
+              const bUrl = URL.createObjectURL(new Blob([rec.bytes], { type: 'video/webm' }));
+              blobUrlCache.set(info.key, bUrl);
+              return bUrl;
+            }
+
+            // Intercept HTML5 <video>/<audio> src & load() so Ren'Py Web videos play from Blob URLs without 404
+            const mediaProto = HTMLMediaElement.prototype;
+            const origSrcDesc = Object.getOwnPropertyDescriptor(mediaProto, 'src');
+            const origSetAttr = Element.prototype.setAttribute;
+            const origMediaLoad = mediaProto.load;
+
+            function patchMediaElement(el, rawVal) {
+              const info = resolveAsset(rawVal);
+              if (!info) return false;
+              el._pendingStreamInfo = info;
+              getVideoBlobUrl(info).then(bUrl => {
+                if (bUrl && el._pendingStreamInfo === info) {
+                  origSrcDesc.set.call(el, bUrl);
+                  origMediaLoad.call(el);
+                  el.play().catch(() => {});
+                }
+              });
+              return true;
+            }
+
+            Object.defineProperty(mediaProto, 'src', {
+              get: function() { return origSrcDesc.get.call(this); },
+              set: function(val) {
+                if (!patchMediaElement(this, val)) {
+                  this._pendingStreamInfo = null;
+                  origSrcDesc.set.call(this, val);
+                }
+              },
+              configurable: true
+            });
+
+            Element.prototype.setAttribute = function(name, val) {
+              if ((this instanceof HTMLMediaElement || this instanceof HTMLSourceElement) && name.toLowerCase() === 'src') {
+                const targetMedia = (this instanceof HTMLSourceElement) ? this.parentElement : this;
+                if (targetMedia && patchMediaElement(targetMedia, val)) return;
+              }
+              return origSetAttr.apply(this, arguments);
+            };
+
+            mediaProto.load = function() {
+              const curSrc = this.getAttribute('src') || origSrcDesc.get.call(this);
+              if (curSrc && patchMediaElement(this, curSrc)) return;
+              return origMediaLoad.apply(this, arguments);
+            };
+
+            for (let i = 0; i < Math.min(2, ALL_CHUNKS.length); i++) {
+              loadChunk(ALL_CHUNKS[i], false, 2).catch(() => {});
             }
 
             window.fetch = async function(resource, init) {
