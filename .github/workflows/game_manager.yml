@@ -145,36 +145,53 @@ jobs:
               -d "{\"chat_id\":\"${TG_CHAT}\",\"text\":\"🗑️ Removed requested game(s) & freed storage! Send /status to verify.\"}" >/dev/null
           fi
 
-      - name: Install Tools, Dual unrpyc (Py3 + Py2), ffmpeg & Ren'Py 8.5 Web SDK
+      - name: Setup Toolchain (Drive Cache -> ~12s | Auto-Uploads on First Run)
         if: ${{ github.event.inputs.target_archive != 'LIST' && github.event.inputs.target_archive != 'list' && github.event.inputs.target_archive != 'STATUS' && github.event.inputs.target_archive != 'status' && !startsWith(github.event.inputs.target_archive, 'DELETE:') && !startsWith(github.event.inputs.target_archive, 'delete:') }}
         run: |
-          sudo apt-get update
-          sudo apt-get install -y p7zip-full unrar wget zip unzip python3 python3-pip tar bzip2 ffmpeg xvfb git
-          pip3 install -q unrpa || true
-          wget -q "https://raw.githubusercontent.com/Shizmob/rpatool/master/rpatool" -O /usr/local/bin/rpatool
-          chmod +x /usr/local/bin/rpatool
+          if rclone lsf gdrive:Tools/renpy_toolchain.tar >/dev/null 2>&1; then
+            echo "⚡ Pulling cached toolchain from Google Drive..."
+            rclone copyto gdrive:Tools/renpy_toolchain.tar /tmp/renpy_toolchain.tar --multi-thread-streams 8 --drive-chunk-size 128M
+            tar -xf /tmp/renpy_toolchain.tar -C .
+            rm -f /tmp/renpy_toolchain.tar
+          else
+            echo "📦 First run: downloading tools & caching to gdrive:Tools/renpy_toolchain.tar..."
+            mkdir -p toolchain/bin toolchain/opt
+            wget -q "https://raw.githubusercontent.com/Shizmob/rpatool/master/rpatool" -O toolchain/bin/rpatool
+            chmod +x toolchain/bin/rpatool
 
-          git clone --depth 1 https://github.com/CensoredUsername/unrpyc.git /opt/unrpyc_py3
-          git clone --depth 1 --branch legacy https://github.com/CensoredUsername/unrpyc.git /opt/unrpyc_py2 || git clone --depth 1 https://github.com/CensoredUsername/unrpyc.git /opt/unrpyc_py2
+            git clone --depth 1 https://github.com/CensoredUsername/unrpyc.git toolchain/opt/unrpyc_py3
+            git clone --depth 1 --branch legacy https://github.com/CensoredUsername/unrpyc.git toolchain/opt/unrpyc_py2 || git clone --depth 1 https://github.com/CensoredUsername/unrpyc.git toolchain/opt/unrpyc_py2
 
-          RENPY7_VER="7.7.3"
-          wget -q "https://www.renpy.org/dl/${RENPY7_VER}/renpy-${RENPY7_VER}-sdk.tar.bz2"
-          tar -xjf "renpy-${RENPY7_VER}-sdk.tar.bz2"
-          mv "renpy-${RENPY7_VER}-sdk" renpy7_sdk
-          rm -f "renpy-${RENPY7_VER}-sdk.tar.bz2"
+            RENPY7_VER="7.7.3"
+            wget -q "https://www.renpy.org/dl/${RENPY7_VER}/renpy-${RENPY7_VER}-sdk.tar.bz2"
+            tar -xjf "renpy-${RENPY7_VER}-sdk.tar.bz2"
+            mv "renpy-${RENPY7_VER}-sdk" toolchain/renpy7_sdk
+            rm -f "renpy-${RENPY7_VER}-sdk.tar.bz2"
 
-          RENPY_VER="8.5.0"
-          wget -q "https://www.renpy.org/dl/${RENPY_VER}/renpy-${RENPY_VER}-sdk.tar.bz2"
-          tar -xjf "renpy-${RENPY_VER}-sdk.tar.bz2"
-          mv "renpy-${RENPY_VER}-sdk" renpy_sdk
-          rm -f "renpy-${RENPY_VER}-sdk.tar.bz2"
+            RENPY_VER="8.5.0"
+            wget -q "https://www.renpy.org/dl/${RENPY_VER}/renpy-${RENPY7_VER}-sdk.tar.bz2" 2>/dev/null || true
+            wget -q "https://www.renpy.org/dl/${RENPY_VER}/renpy-${RENPY_VER}-sdk.tar.bz2"
+            tar -xjf "renpy-${RENPY_VER}-sdk.tar.bz2"
+            mv "renpy-${RENPY_VER}-sdk" toolchain/renpy_sdk
+            rm -f "renpy-${RENPY_VER}-sdk.tar.bz2"
 
-          wget -q "https://www.renpy.org/dl/${RENPY_VER}/renpy-${RENPY_VER}-web.zip"
-          unzip -q "renpy-${RENPY_VER}-web.zip" -d temp_web/
-          mkdir -p renpy_sdk/web
-          WEB_INNER=$(dirname "$(find temp_web -name "index.html" | head -n 1)")
-          cp -r "$WEB_INNER"/* renpy_sdk/web/
-          rm -rf temp_web "renpy-${RENPY_VER}-web.zip"
+            wget -q "https://www.renpy.org/dl/${RENPY_VER}/renpy-${RENPY_VER}-web.zip"
+            unzip -q "renpy-${RENPY_VER}-web.zip" -d temp_web/
+            mkdir -p toolchain/renpy_sdk/web
+            WEB_INNER=$(dirname "$(find temp_web -name "index.html" | head -n 1)")
+            cp -r "$WEB_INNER"/* toolchain/renpy_sdk/web/
+            rm -rf temp_web "renpy-${RENPY_VER}-web.zip"
+
+            tar -cf /tmp/renpy_toolchain.tar toolchain
+            rclone copyto /tmp/renpy_toolchain.tar gdrive:Tools/renpy_toolchain.tar --multi-thread-streams 8 --drive-chunk-size 128M
+            rm -f /tmp/renpy_toolchain.tar
+          fi
+
+          sudo ln -sf "$PWD/toolchain/bin/rpatool" /usr/local/bin/rpatool
+          sudo ln -sfn "$PWD/toolchain/opt/unrpyc_py3" /opt/unrpyc_py3
+          sudo ln -sfn "$PWD/toolchain/opt/unrpyc_py2" /opt/unrpyc_py2
+          ln -sfn "$PWD/toolchain/renpy_sdk" renpy_sdk
+          ln -sfn "$PWD/toolchain/renpy7_sdk" renpy7_sdk
 
       - name: Build Selected Games into Script-Ordered 12MB Zero-Blur Chunks & Deploy
         if: ${{ github.event.inputs.target_archive != 'LIST' && github.event.inputs.target_archive != 'list' && github.event.inputs.target_archive != 'STATUS' && github.event.inputs.target_archive != 'status' && !startsWith(github.event.inputs.target_archive, 'DELETE:') && !startsWith(github.event.inputs.target_archive, 'delete:') }}
@@ -240,7 +257,7 @@ jobs:
               continue
             fi
 
-            if ! (7z x "${ARCHIVE}" -oraw_extract -y >/dev/null || unrar x -y "${ARCHIVE}" raw_extract/ >/dev/null); then
+            if ! 7z x "${ARCHIVE}" -oraw_extract -y >/dev/null; then
               notify_tg "⚠️ Failed & Skipped: $ARCHIVE (Archive extraction error)"
               rm -rf "${ARCHIVE}" raw_extract
               continue
@@ -257,81 +274,20 @@ jobs:
             cp -a "$RENPY_ROOT"/. game_src/
             rm -rf raw_extract
 
-            # 1. Unpack all .rpa archives cleanly
             find game_src/game -name "*.rpa" | sort | while read -r rpa; do
-              python3 /usr/local/bin/rpatool -x "$rpa" -o game_src/game/ || unrpa -mp game_src/game/ "$rpa" || true
+              python3 /usr/local/bin/rpatool -x "$rpa" -o game_src/game/ || true
               rm -f "$rpa"
             done
 
-            # 2. Decompile .rpyc safely — keep .rpyc if decompiled .rpy fails syntax check
-            python3 /opt/unrpyc_py3/unrpyc.py game_src/game/ >/dev/null 2>&1 || true
+            python3 /opt/unrpyc_py3/unrpyc.py -c game_src/game/ >/dev/null 2>&1 || true
             PY2_BIN=$(find renpy7_sdk/lib -name "python" -type f | head -n 1)
             if [ -n "$PY2_BIN" ]; then
-              "$PY2_BIN" /opt/unrpyc_py2/unrpyc.py game_src/game/ >/dev/null 2>&1 || true
+              "$PY2_BIN" /opt/unrpyc_py2/unrpyc.py -c game_src/game/ >/dev/null 2>&1 || true
             fi
-
-            # Auto-patch Python 2 -> Python 3 syntax in .rpy files so Ren'Py 7 games compile cleanly on Ren'Py 8.5
-            python3 - << 'PY2TO3'
-          import os, re
-          for root, _, files in os.walk("game_src/game"):
-              for fn in files:
-                  if not fn.endswith(".rpy"):
-                      continue
-                  p = os.path.join(root, fn)
-                  try:
-                      txt = open(p, "r", encoding="utf-8", errors="ignore").read()
-                      orig = txt
-                      txt = re.sub(r'\bexcept\s+([A-Za-z0-9_.]+)\s*,\s*([A-Za-z0-9_]+)\s*:', r'except \1 as \2:', txt)
-                      txt = re.sub(r'\bxrange\s*\(', 'range(', txt)
-                      txt = re.sub(r'\.iteritems\s*\(\)', '.items()', txt)
-                      txt = re.sub(r'\.itervalues\s*\(\)', '.values()', txt)
-                      txt = re.sub(r'\.iterkeys\s*\(\)', '.keys()', txt)
-                      if txt != orig:
-                          open(p, "w", encoding="utf-8").write(txt)
-                  except Exception:
-                      pass
-          PY2TO3
-
-            # Validate each .rpy; if a decompiled .rpy is corrupt/empty, remove it and fall back to .rpyc
             find game_src/game -name "*.rpy" | while read -r rpy; do
               rpyc="${rpy%.rpy}.rpyc"
-              if [ ! -s "$rpy" ]; then
-                rm -f "$rpy"
-              elif [ -f "$rpyc" ]; then
-                rm -f "$rpyc"
-              fi
+              [ -s "$rpy" ] && [ -f "$rpyc" ] && rm -f "$rpyc"
             done
-
-            # 3. Strip desktop-only binaries
-            find game_src/game -type f \( -name "*.exe" -o -name "*.dll" -o -name "*.so" -o -name "*.dylib" \) -delete
-
-            # 4. Convert ALL non-WebM videos to proper .webm (VP8 + Vorbis) AND rewrite .rpy references
-            find game_src/game -type f \( -iname "*.mkv" -o -iname "*.mp4" -o -iname "*.avi" -o -iname "*.mov" -o -iname "*.ogv" \) | while read -r vid; do
-              base="${vid%.*}"
-              if ffmpeg -nostdin -y -i "$vid" -f lavfi -i anullsrc=channel_layout=stereo:sample_rate=44100 \
-                -map 0:v:0 -map 0:a:0? -map 1:a:0 -shortest \
-                -c:v libvpx -crf 24 -b:v 2500k -deadline realtime -cpu-used 6 \
-                -c:a libvorbis -ar 44100 -ac 2 "${base}.webm" >/dev/null 2>&1; then
-                [ "$vid" != "${base}.webm" ] && rm -f "$vid"
-              fi
-            done
-
-            find game_src/game -type f -iname "*.webm" | while read -r wvid; do
-              VCODEC=$(ffprobe -v error -select_streams v:0 -show_entries stream=codec_name -of csv=p=0 "$wvid" 2>/dev/null)
-              ACODEC=$(ffprobe -v error -select_streams a:0 -show_entries stream=codec_name -of csv=p=0 "$wvid" 2>/dev/null)
-              if [ "$VCODEC" != "vp8" ] || [ -z "$ACODEC" ]; then
-                if ffmpeg -nostdin -y -i "$wvid" -f lavfi -i anullsrc=channel_layout=stereo:sample_rate=44100 \
-                  -map 0:v:0 -map 0:a:0? -map 1:a:0 -shortest \
-                  -c:v libvpx -crf 24 -b:v 2500k -deadline realtime -cpu-used 6 \
-                  -c:a libvorbis -ar 44100 -ac 2 "${wvid}.fixed.webm" >/dev/null 2>&1; then
-                  mv "${wvid}.fixed.webm" "$wvid"
-                else
-                  rm -f "${wvid}.fixed.webm"
-                fi
-              fi
-            done
-
-            find game_src/game -type f -name "*.rpy" -exec sed -i -E 's/\.(mp4|mkv|avi|mov|ogv)(["'\''])/.webm\2/gi' {} +
 
             cat << 'TRACEPY' > trace_story.py
           import os, re, json
@@ -452,6 +408,31 @@ jobs:
           TRACEPY
             python3 trace_story.py || echo "{}" > script_order.json
 
+            echo "Normalizing non-WebM & audio-less videos..."
+            find game_src/game -type f \( -iname "*.mkv" -o -iname "*.mp4" -o -iname "*.avi" -o -iname "*.mov" -o -iname "*.ogv" \) | while read -r vid; do
+              base="${vid%.*}"
+              if ffmpeg -nostdin -y -i "$vid" -f lavfi -i anullsrc=channel_layout=stereo:sample_rate=44100 \
+                -map 0:v:0 -map 0:a:0? -map 1:a:0 -shortest \
+                -c:v libvpx -crf 28 -b:v 1500k -deadline realtime -cpu-used 6 \
+                -c:a libvorbis -ar 44100 -ac 2 "${base}.webm" >/dev/null 2>&1; then
+                [ "$vid" != "${base}.webm" ] && rm -f "$vid"
+              fi
+            done
+
+            find game_src/game -type f -iname "*.webm" | while read -r wvid; do
+              HAS_AUDIO=$(ffprobe -v error -select_streams a -show_entries stream=codec_type -of csv=p=0 "$wvid" 2>/dev/null)
+              if [ -z "$HAS_AUDIO" ]; then
+                if ffmpeg -nostdin -y -i "$wvid" -f lavfi -i anullsrc=channel_layout=stereo:sample_rate=44100 \
+                  -map 0:v:0 -map 1:a:0 -shortest -c:v copy -c:a libvorbis -ar 44100 -ac 2 "${wvid}.aud.webm" >/dev/null 2>&1; then
+                  mv "${wvid}.aud.webm" "$wvid"
+                else
+                  rm -f "${wvid}.aud.webm"
+                fi
+              fi
+            done
+
+            find game_src/game -type f -name "*.rpy" -exec sed -i -E 's/\.(mp4|mkv|avi|mov|ogv)(["'\''])/.webm\2/gi' {} +
+
             rm -f game_src/game/progressive_download.txt
 
             echo "Running Ren'Py web_build (up to 45m)..."
@@ -465,21 +446,15 @@ jobs:
             fi
             rm -rf game_src trace_story.py web_build.log
 
-            # FIX: Correctly map game.zip internal root (/game) with _placeholders/ + progressive_download.txt
             python3 - << 'SPLITZIP'
-          import zipfile, os, base64
-
-          TINY_PNG = base64.b64decode("iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAACklEQVR4nGMAAQAABQABDQottAAAAABJRU5ErkJggg==")
-          TINY_EMPTY = b""
+          import zipfile, os
 
           gzip_path = "web_out/game.zip"
           if os.path.exists(gzip_path):
               tmp_zip = gzip_path + ".clean"
               with zipfile.ZipFile(gzip_path, 'r') as zin:
                   existing_names = set(zin.namelist())
-                  # Detect whether game.zip mounts at /game (no leading game/) or root (leading game/)
                   has_game_prefix = any(n.startswith("game/") for n in existing_names if not n.endswith("/"))
-                  prog_entries = []
 
                   with zipfile.ZipFile(tmp_zip, 'w', zipfile.ZIP_DEFLATED) as zout:
                       for item in zin.infolist():
@@ -498,21 +473,14 @@ jobs:
                               with open(dest_path, "wb") as out_f:
                                   out_f.write(zin.read(item.filename))
 
-                              # Exact path inside /game mount for _placeholders/ and progressive_download.txt
-                              rel_inside_game = fn[5:] if fn.startswith('game/') else fn
-                              ph_path = f"game/_placeholders/{rel_inside_game}" if has_game_prefix else f"_placeholders/{rel_inside_game}"
-                              if ph_path not in existing_names:
-                                  dummy = TINY_PNG if low.endswith(('.png', '.jpg', '.jpeg', '.webp', '.avif')) else TINY_EMPTY
-                                  zout.writestr(ph_path, dummy)
-                                  existing_names.add(ph_path)
-                              prog_entries.append(f"+ {rel_inside_game}")
+                              if not is_video:
+                                  rel_inside_game = fn[5:] if fn.startswith('game/') else fn
+                                  ph_path = f"game/_placeholders/{rel_inside_game}" if has_game_prefix else f"_placeholders/{rel_inside_game}"
+                                  if ph_path not in existing_names:
+                                      zout.writestr(ph_path, b"")
+                                      existing_names.add(ph_path)
                           else:
                               zout.writestr(item, zin.read(item.filename))
-
-                      if prog_entries:
-                          pd_path = "game/progressive_download.txt" if has_game_prefix else "progressive_download.txt"
-                          if pd_path not in existing_names:
-                              zout.writestr(pd_path, "\n".join(prog_entries) + "\n")
               os.replace(tmp_zip, gzip_path)
           SPLITZIP
 
@@ -554,7 +522,6 @@ jobs:
 
           def priority_key(item):
               p = item[1].lower()
-              # Prioritize UI/menus AND videos first so video cutscenes never stall or 404
               if any(k in p for k in ['menu', 'black', 'idle', 'hover', 'logo']) or p.endswith('.webm'):
                   return (0, 0, natural_tokens(p))
               if p in rank_map:
@@ -638,7 +605,7 @@ jobs:
             const BASE_URL = __BASE_URL__;
             const MANIFEST = __MANIFEST__;
             const ALL_CHUNKS = __CHUNKS__;
-            const MAX_BUFFER_BYTES = 512 * 1024 * 1024;
+            const MAX_BUFFER_BYTES = 384 * 1024 * 1024;
 
             let hud = null;
             function updateHud(text) {
@@ -687,6 +654,15 @@ jobs:
               } catch (e) {}
             }
 
+            function unlinkFromEmscriptenFS(relPath) {
+              try {
+                const FS = (window.Module && window.Module.FS) || window.FS;
+                if (!FS) return;
+                const fullPath = '/' + relPath.replace(/^\\/+/, '');
+                FS.unlink(fullPath);
+              } catch (e) {}
+            }
+
             const fifoCache = new Map();
             const inflightChunks = new Map();
             const blobUrlCache = new Map();
@@ -702,6 +678,9 @@ jobs:
                 if (!oldestKey) break;
                 const removed = fifoCache.get(oldestKey);
                 currentBufferBytes -= removed.size;
+                for (const p of removed.files.keys()) {
+                  unlinkFromEmscriptenFS(p);
+                }
                 removed.files.clear();
                 fifoCache.delete(oldestKey);
               }
@@ -738,9 +717,12 @@ jobs:
                     const slicedAb = data.buffer.slice(data.byteOffset, data.byteOffset + data.byteLength);
                     fileMap.set(path, { bytes: data, ab: slicedAb });
                     totalSize += data.byteLength;
-                    writeToEmscriptenFS(path, data);
-                    if (path.match(/\\.(webm|mp4|mkv|ogv|avi|mov)$/i) && !blobUrlCache.has(path)) {
-                      blobUrlCache.set(path, URL.createObjectURL(new Blob([data], { type: 'video/webm' })));
+                    if (path.match(/\\.(webm|mp4|mkv|ogv|avi|mov)$/i)) {
+                      if (!blobUrlCache.has(path)) {
+                        blobUrlCache.set(path, URL.createObjectURL(new Blob([data], { type: 'video/webm' })));
+                      }
+                    } else {
+                      writeToEmscriptenFS(path, data);
                     }
                   }
                   evictIfNeeded(totalSize);
@@ -851,7 +833,7 @@ jobs:
               return origMediaLoad.apply(this, arguments);
             };
 
-            for (let i = 0; i < Math.min(6, ALL_CHUNKS.length); i++) {
+            for (let i = 0; i < Math.min(4, ALL_CHUNKS.length); i++) {
               loadChunk(ALL_CHUNKS[i], false, 4).catch(() => {});
             }
 
