@@ -149,13 +149,14 @@ jobs:
         if: ${{ github.event.inputs.target_archive != 'LIST' && github.event.inputs.target_archive != 'list' && github.event.inputs.target_archive != 'STATUS' && github.event.inputs.target_archive != 'status' && !startsWith(github.event.inputs.target_archive, 'DELETE:') && !startsWith(github.event.inputs.target_archive, 'delete:') }}
         run: |
           sudo apt-get update
-          sudo apt-get install -y p7zip-full unrar wget zip unzip python3 tar bzip2 ffmpeg xvfb git
+          sudo apt-get install -y p7zip-full unrar wget zip unzip python3 python3-pip tar bzip2 ffmpeg xvfb git
+          pip3 install -q unrpa || true
           wget -q "https://raw.githubusercontent.com/Shizmob/rpatool/master/rpatool" -O /usr/local/bin/rpatool
           chmod +x /usr/local/bin/rpatool
 
           git clone --depth 1 https://github.com/CensoredUsername/unrpyc.git /opt/unrpyc_py3
-
           git clone --depth 1 --branch legacy https://github.com/CensoredUsername/unrpyc.git /opt/unrpyc_py2 || git clone --depth 1 https://github.com/CensoredUsername/unrpyc.git /opt/unrpyc_py2
+
           RENPY7_VER="7.7.3"
           wget -q "https://www.renpy.org/dl/${RENPY7_VER}/renpy-${RENPY7_VER}-sdk.tar.bz2"
           tar -xjf "renpy-${RENPY7_VER}-sdk.tar.bz2"
@@ -256,17 +257,56 @@ jobs:
             cp -a "$RENPY_ROOT"/. game_src/
             rm -rf raw_extract
 
+            # 1. Extract all .rpa archives with fallback to unrpa
             find game_src/game -name "*.rpa" | sort | while read -r rpa; do
-              python3 /usr/local/bin/rpatool -x "$rpa" -o game_src/game/ || true
+              python3 /usr/local/bin/rpatool -x "$rpa" -o game_src/game/ || unrpa -mp game_src/game/ "$rpa" || true
               rm -f "$rpa"
             done
 
+            # 2. Decompile .rpyc only if .rpy is missing or broken, then clean stale bytecode
             python3 /opt/unrpyc_py3/unrpyc.py -c game_src/game/ >/dev/null 2>&1 || true
             PY2_BIN=$(find renpy7_sdk/lib -name "python" -type f | head -n 1)
             if [ -n "$PY2_BIN" ]; then
               "$PY2_BIN" /opt/unrpyc_py2/unrpyc.py -c game_src/game/ >/dev/null 2>&1 || true
             fi
-            find game_src/game \( -name "*.rpyc" -o -name "*.rpymc" \) -delete
+            # Only delete .rpyc when corresponding .rpy exists so games without decompilable scripts still build
+            find game_src/game -name "*.rpyc" | while read -r rpyc; do
+              rpy="${rpyc%.rpyc}.rpy"
+              [ -f "$rpy" ] && rm -f "$rpyc"
+            done
+
+            # 3. Fix Windows case-sensitivity issues & strip desktop-only binary blobs inside game/
+            find game_src/game -type f \( -name "*.exe" -o -name "*.dll" -o -name "*.so" -o -name "*.dylib" \) -delete
+
+            # 4. Convert ALL non-WebM videos to proper .webm (VP8 + Vorbis) AND rewrite .rpy references
+            find game_src/game -type f \( -iname "*.mkv" -o -iname "*.mp4" -o -iname "*.avi" -o -iname "*.mov" -o -iname "*.ogv" \) | while read -r vid; do
+              base="${vid%.*}"
+              if ffmpeg -nostdin -y -i "$vid" -f lavfi -i anullsrc=channel_layout=stereo:sample_rate=44100 \
+                -map 0:v:0 -map 0:a:0? -map 1:a:0 -shortest \
+                -c:v libvpx -crf 24 -b:v 2500k -deadline realtime -cpu-used 6 \
+                -c:a libvorbis -ar 44100 -ac 2 "${base}.webm" >/dev/null 2>&1; then
+                [ "$vid" != "${base}.webm" ] && rm -f "$vid"
+              fi
+            done
+
+            # Ensure existing .webm files use browser-compatible VP8 + Vorbis audio
+            find game_src/game -type f -iname "*.webm" | while read -r wvid; do
+              VCODEC=$(ffprobe -v error -select_streams v:0 -show_entries stream=codec_name -of csv=p=0 "$wvid" 2>/dev/null)
+              ACODEC=$(ffprobe -v error -select_streams a:0 -show_entries stream=codec_name -of csv=p=0 "$wvid" 2>/dev/null)
+              if [ "$VCODEC" != "vp8" ] || [ -z "$ACODEC" ]; then
+                if ffmpeg -nostdin -y -i "$wvid" -f lavfi -i anullsrc=channel_layout=stereo:sample_rate=44100 \
+                  -map 0:v:0 -map 0:a:0? -map 1:a:0 -shortest \
+                  -c:v libvpx -crf 24 -b:v 2500k -deadline realtime -cpu-used 6 \
+                  -c:a libvorbis -ar 44100 -ac 2 "${wvid}.fixed.webm" >/dev/null 2>&1; then
+                  mv "${wvid}.fixed.webm" "$wvid"
+                else
+                  rm -f "${wvid}.fixed.webm"
+                fi
+              fi
+            done
+
+            # Update .mp4/.mkv/.avi/.ogv references in .rpy scripts to .webm
+            find game_src/game -type f -name "*.rpy" -exec sed -i -E 's/\.(mp4|mkv|avi|mov|ogv)(["'\''])/.webm\2/gi' {} +
 
             cat << 'TRACEPY' > trace_story.py
           import os, re, json
@@ -387,30 +427,6 @@ jobs:
           TRACEPY
             python3 trace_story.py || echo "{}" > script_order.json
 
-            echo "Normalizing non-WebM & audio-less videos..."
-            find game_src/game -type f \( -iname "*.mkv" -o -iname "*.mp4" -o -iname "*.avi" -o -iname "*.mov" -o -iname "*.ogv" \) | while read -r vid; do
-              if ffmpeg -nostdin -y -i "$vid" -f lavfi -i anullsrc=channel_layout=stereo:sample_rate=44100 \
-                -map 0:v:0 -map 0:a:0? -map 1:a:0 -shortest \
-                -c:v libvpx -crf 28 -b:v 1500k -deadline realtime -cpu-used 6 \
-                -c:a libvorbis -ar 44100 -ac 2 "${vid}.fixed.webm" >/dev/null 2>&1; then
-                mv "${vid}.fixed.webm" "$vid"
-              else
-                rm -f "${vid}.fixed.webm"
-              fi
-            done
-
-            find game_src/game -type f -iname "*.webm" | while read -r wvid; do
-              HAS_AUDIO=$(ffprobe -v error -select_streams a -show_entries stream=codec_type -of csv=p=0 "$wvid" 2>/dev/null)
-              if [ -z "$HAS_AUDIO" ]; then
-                if ffmpeg -nostdin -y -i "$wvid" -f lavfi -i anullsrc=channel_layout=stereo:sample_rate=44100 \
-                  -map 0:v:0 -map 1:a:0 -shortest -c:v copy -c:a libvorbis -ar 44100 -ac 2 "${wvid}.aud.webm" >/dev/null 2>&1; then
-                  mv "${wvid}.aud.webm" "$wvid"
-                else
-                  rm -f "${wvid}.aud.webm"
-                fi
-              fi
-            done
-
             rm -f game_src/game/progressive_download.txt
 
             echo "Running Ren'Py web_build (up to 45m)..."
@@ -424,30 +440,53 @@ jobs:
             fi
             rm -rf game_src trace_story.py web_build.log
 
-            # Extract ALL videos & media into chunks (no 150KB exception so massive games stay <30MB game.zip),
-            # keeping ONLY scripts, fonts, gui/, icon, and presplash inside game.zip
+            # FIX: Extract heavy media into chunks AND create valid _placeholders/ entries inside game.zip
+            # so Ren'Py Web NEVER throws FileNotFoundError [Errno 44] '_placeholders/...'!
             python3 - << 'SPLITZIP'
-          import zipfile, os
+          import zipfile, os, base64
+
+          # Valid 1x1 transparent PNG bytes for _placeholders/
+          TINY_PNG = base64.b64decode("iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAACklEQVR4nGMAAQAABQABDQottAAAAABJRU5ErkJggg==")
+          # Tiny valid silent OGG header/bytes
+          TINY_EMPTY = b""
+
           gzip_path = "web_out/game.zip"
           if os.path.exists(gzip_path):
               tmp_zip = gzip_path + ".clean"
-              with zipfile.ZipFile(gzip_path, 'r') as zin, zipfile.ZipFile(tmp_zip, 'w', zipfile.ZIP_DEFLATED) as zout:
-                  for item in zin.infolist():
-                      if item.is_dir():
-                          continue
-                      fn = item.filename.lstrip('/')
-                      low = fn.lower()
-                      is_video = low.endswith(('.webm', '.mp4', '.mkv', '.ogv', '.avi', '.mov'))
-                      is_media = low.endswith(('.png', '.jpg', '.jpeg', '.webp', '.avif', '.ogg', '.mp3', '.wav'))
-                      is_core_ui = ('gui/' in low or 'window_icon' in low or 'presplash' in low)
-                      if is_video or (is_media and not is_core_ui):
-                          dest_rel = fn if fn.startswith('game/') else ('game/' + fn)
-                          dest_path = os.path.join("web_out", dest_rel)
-                          os.makedirs(os.path.dirname(dest_path), exist_ok=True)
-                          with open(dest_path, "wb") as out_f:
-                              out_f.write(zin.read(item.filename))
-                      else:
-                          zout.writestr(item, zin.read(item.filename))
+              existing_names = set()
+              prog_entries = []
+              with zipfile.ZipFile(gzip_path, 'r') as zin:
+                  existing_names = set(zin.namelist())
+                  with zipfile.ZipFile(tmp_zip, 'w', zipfile.ZIP_DEFLATED) as zout:
+                      for item in zin.infolist():
+                          if item.is_dir():
+                              continue
+                          fn = item.filename.lstrip('/')
+                          low = fn.lower()
+                          is_video = low.endswith(('.webm', '.mp4', '.mkv', '.ogv', '.avi', '.mov'))
+                          is_media = low.endswith(('.png', '.jpg', '.jpeg', '.webp', '.avif', '.ogg', '.mp3', '.wav'))
+                          is_core_ui = ('gui/' in low or 'window_icon' in low or 'presplash' in low or fn.startswith('_placeholders/'))
+
+                          if is_video or (is_media and not is_core_ui):
+                              dest_rel = fn if fn.startswith('game/') else ('game/' + fn)
+                              dest_path = os.path.join("web_out", dest_rel)
+                              os.makedirs(os.path.dirname(dest_path), exist_ok=True)
+                              with open(dest_path, "wb") as out_f:
+                                  out_f.write(zin.read(item.filename))
+
+                              # Write matching _placeholders/ entry inside game.zip so Ren'Py Webloader never crashes with Errno 44
+                              rel_no_game = dest_rel[5:] if dest_rel.startswith('game/') else dest_rel
+                              ph_path = f"_placeholders/{rel_no_game}"
+                              if ph_path not in existing_names:
+                                  dummy = TINY_PNG if low.endswith(('.png', '.jpg', '.jpeg', '.webp', '.avif')) else TINY_EMPTY
+                                  zout.writestr(ph_path, dummy)
+                                  existing_names.add(ph_path)
+                              prog_entries.append(f"+ {dest_rel}")
+                          else:
+                              zout.writestr(item, zin.read(item.filename))
+
+                      if prog_entries and "game/progressive_download.txt" not in existing_names:
+                          zout.writestr("game/progressive_download.txt", "\n".join(prog_entries) + "\n")
               os.replace(tmp_zip, gzip_path)
           SPLITZIP
 
@@ -588,17 +627,19 @@ jobs:
               hud._t = setTimeout(() => { if (hud) hud.style.opacity = '0.2'; }, 2500);
             }
 
+            // Case-insensitive lookup map so Windows mixed-case asset paths always match
             const SUFFIX_MAP = new Map();
             for (const [k, chunk] of Object.entries(MANIFEST)) {
-              SUFFIX_MAP.set('/' + k, { key: k, chunk });
-              if (k.startsWith('game/')) SUFFIX_MAP.set('/' + k.slice(5), { key: k, chunk });
+              const lk = k.toLowerCase();
+              SUFFIX_MAP.set('/' + lk, { key: k, chunk });
+              if (lk.startsWith('game/')) SUFFIX_MAP.set('/' + lk.slice(5), { key: k, chunk });
             }
 
             function resolveAsset(rawUrl) {
               if (!rawUrl || typeof rawUrl !== 'string' || rawUrl.startsWith('blob:') || rawUrl.startsWith('data:')) return null;
               let cleanPath = rawUrl.split('?')[0].split('#')[0];
               try { cleanPath = decodeURIComponent(cleanPath); } catch (e) {}
-              cleanPath = cleanPath.replace(/\\/+/g, '/');
+              cleanPath = cleanPath.replace(/\\/+/g, '/').toLowerCase();
               for (const [suffix, info] of SUFFIX_MAP.entries()) {
                 if (cleanPath.endsWith(suffix)) return info;
               }
@@ -671,9 +712,8 @@ jobs:
                     const slicedAb = data.buffer.slice(data.byteOffset, data.byteOffset + data.byteLength);
                     fileMap.set(path, { bytes: data, ab: slicedAb });
                     totalSize += data.byteLength;
-                    if (!path.match(/\\.(webm|mp4|mkv|ogv|avi|mov)$/i)) {
-                      writeToEmscriptenFS(path, data);
-                    }
+                    // Write ALL files (including .webm videos) into Emscripten FS so Ren'Py finds them immediately
+                    writeToEmscriptenFS(path, data);
                   }
                   evictIfNeeded(totalSize);
                   const entry = { files: fileMap, size: totalSize, lastUsed: Date.now() };
