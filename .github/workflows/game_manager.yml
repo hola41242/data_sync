@@ -257,25 +257,52 @@ jobs:
             cp -a "$RENPY_ROOT"/. game_src/
             rm -rf raw_extract
 
-            # 1. Extract all .rpa archives with fallback to unrpa
+            # 1. Unpack all .rpa archives cleanly
             find game_src/game -name "*.rpa" | sort | while read -r rpa; do
               python3 /usr/local/bin/rpatool -x "$rpa" -o game_src/game/ || unrpa -mp game_src/game/ "$rpa" || true
               rm -f "$rpa"
             done
 
-            # 2. Decompile .rpyc only if .rpy is missing or broken, then clean stale bytecode
-            python3 /opt/unrpyc_py3/unrpyc.py -c game_src/game/ >/dev/null 2>&1 || true
+            # 2. Decompile .rpyc safely — keep .rpyc if decompiled .rpy fails syntax check
+            python3 /opt/unrpyc_py3/unrpyc.py game_src/game/ >/dev/null 2>&1 || true
             PY2_BIN=$(find renpy7_sdk/lib -name "python" -type f | head -n 1)
             if [ -n "$PY2_BIN" ]; then
-              "$PY2_BIN" /opt/unrpyc_py2/unrpyc.py -c game_src/game/ >/dev/null 2>&1 || true
+              "$PY2_BIN" /opt/unrpyc_py2/unrpyc.py game_src/game/ >/dev/null 2>&1 || true
             fi
-            # Only delete .rpyc when corresponding .rpy exists so games without decompilable scripts still build
-            find game_src/game -name "*.rpyc" | while read -r rpyc; do
-              rpy="${rpyc%.rpyc}.rpy"
-              [ -f "$rpy" ] && rm -f "$rpyc"
+
+            # Auto-patch Python 2 -> Python 3 syntax in .rpy files so Ren'Py 7 games compile cleanly on Ren'Py 8.5
+            python3 - << 'PY2TO3'
+          import os, re
+          for root, _, files in os.walk("game_src/game"):
+              for fn in files:
+                  if not fn.endswith(".rpy"):
+                      continue
+                  p = os.path.join(root, fn)
+                  try:
+                      txt = open(p, "r", encoding="utf-8", errors="ignore").read()
+                      orig = txt
+                      txt = re.sub(r'\bexcept\s+([A-Za-z0-9_.]+)\s*,\s*([A-Za-z0-9_]+)\s*:', r'except \1 as \2:', txt)
+                      txt = re.sub(r'\bxrange\s*\(', 'range(', txt)
+                      txt = re.sub(r'\.iteritems\s*\(\)', '.items()', txt)
+                      txt = re.sub(r'\.itervalues\s*\(\)', '.values()', txt)
+                      txt = re.sub(r'\.iterkeys\s*\(\)', '.keys()', txt)
+                      if txt != orig:
+                          open(p, "w", encoding="utf-8").write(txt)
+                  except Exception:
+                      pass
+          PY2TO3
+
+            # Validate each .rpy; if a decompiled .rpy is corrupt/empty, remove it and fall back to .rpyc
+            find game_src/game -name "*.rpy" | while read -r rpy; do
+              rpyc="${rpy%.rpy}.rpyc"
+              if [ ! -s "$rpy" ]; then
+                rm -f "$rpy"
+              elif [ -f "$rpyc" ]; then
+                rm -f "$rpyc"
+              fi
             done
 
-            # 3. Fix Windows case-sensitivity issues & strip desktop-only binary blobs inside game/
+            # 3. Strip desktop-only binaries
             find game_src/game -type f \( -name "*.exe" -o -name "*.dll" -o -name "*.so" -o -name "*.dylib" \) -delete
 
             # 4. Convert ALL non-WebM videos to proper .webm (VP8 + Vorbis) AND rewrite .rpy references
@@ -289,7 +316,6 @@ jobs:
               fi
             done
 
-            # Ensure existing .webm files use browser-compatible VP8 + Vorbis audio
             find game_src/game -type f -iname "*.webm" | while read -r wvid; do
               VCODEC=$(ffprobe -v error -select_streams v:0 -show_entries stream=codec_name -of csv=p=0 "$wvid" 2>/dev/null)
               ACODEC=$(ffprobe -v error -select_streams a:0 -show_entries stream=codec_name -of csv=p=0 "$wvid" 2>/dev/null)
@@ -305,7 +331,6 @@ jobs:
               fi
             done
 
-            # Update .mp4/.mkv/.avi/.ogv references in .rpy scripts to .webm
             find game_src/game -type f -name "*.rpy" -exec sed -i -E 's/\.(mp4|mkv|avi|mov|ogv)(["'\''])/.webm\2/gi' {} +
 
             cat << 'TRACEPY' > trace_story.py
@@ -440,23 +465,22 @@ jobs:
             fi
             rm -rf game_src trace_story.py web_build.log
 
-            # FIX: Extract heavy media into chunks AND create valid _placeholders/ entries inside game.zip
-            # so Ren'Py Web NEVER throws FileNotFoundError [Errno 44] '_placeholders/...'!
+            # FIX: Correctly map game.zip internal root (/game) with _placeholders/ + progressive_download.txt
             python3 - << 'SPLITZIP'
           import zipfile, os, base64
 
-          # Valid 1x1 transparent PNG bytes for _placeholders/
           TINY_PNG = base64.b64decode("iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAACklEQVR4nGMAAQAABQABDQottAAAAABJRU5ErkJggg==")
-          # Tiny valid silent OGG header/bytes
           TINY_EMPTY = b""
 
           gzip_path = "web_out/game.zip"
           if os.path.exists(gzip_path):
               tmp_zip = gzip_path + ".clean"
-              existing_names = set()
-              prog_entries = []
               with zipfile.ZipFile(gzip_path, 'r') as zin:
                   existing_names = set(zin.namelist())
+                  # Detect whether game.zip mounts at /game (no leading game/) or root (leading game/)
+                  has_game_prefix = any(n.startswith("game/") for n in existing_names if not n.endswith("/"))
+                  prog_entries = []
+
                   with zipfile.ZipFile(tmp_zip, 'w', zipfile.ZIP_DEFLATED) as zout:
                       for item in zin.infolist():
                           if item.is_dir():
@@ -465,7 +489,7 @@ jobs:
                           low = fn.lower()
                           is_video = low.endswith(('.webm', '.mp4', '.mkv', '.ogv', '.avi', '.mov'))
                           is_media = low.endswith(('.png', '.jpg', '.jpeg', '.webp', '.avif', '.ogg', '.mp3', '.wav'))
-                          is_core_ui = ('gui/' in low or 'window_icon' in low or 'presplash' in low or fn.startswith('_placeholders/'))
+                          is_core_ui = ('gui/' in low or 'window_icon' in low or 'presplash' in low or '_placeholders/' in low)
 
                           if is_video or (is_media and not is_core_ui):
                               dest_rel = fn if fn.startswith('game/') else ('game/' + fn)
@@ -474,19 +498,21 @@ jobs:
                               with open(dest_path, "wb") as out_f:
                                   out_f.write(zin.read(item.filename))
 
-                              # Write matching _placeholders/ entry inside game.zip so Ren'Py Webloader never crashes with Errno 44
-                              rel_no_game = dest_rel[5:] if dest_rel.startswith('game/') else dest_rel
-                              ph_path = f"_placeholders/{rel_no_game}"
+                              # Exact path inside /game mount for _placeholders/ and progressive_download.txt
+                              rel_inside_game = fn[5:] if fn.startswith('game/') else fn
+                              ph_path = f"game/_placeholders/{rel_inside_game}" if has_game_prefix else f"_placeholders/{rel_inside_game}"
                               if ph_path not in existing_names:
                                   dummy = TINY_PNG if low.endswith(('.png', '.jpg', '.jpeg', '.webp', '.avif')) else TINY_EMPTY
                                   zout.writestr(ph_path, dummy)
                                   existing_names.add(ph_path)
-                              prog_entries.append(f"+ {dest_rel}")
+                              prog_entries.append(f"+ {rel_inside_game}")
                           else:
                               zout.writestr(item, zin.read(item.filename))
 
-                      if prog_entries and "game/progressive_download.txt" not in existing_names:
-                          zout.writestr("game/progressive_download.txt", "\n".join(prog_entries) + "\n")
+                      if prog_entries:
+                          pd_path = "game/progressive_download.txt" if has_game_prefix else "progressive_download.txt"
+                          if pd_path not in existing_names:
+                              zout.writestr(pd_path, "\n".join(prog_entries) + "\n")
               os.replace(tmp_zip, gzip_path)
           SPLITZIP
 
@@ -528,7 +554,8 @@ jobs:
 
           def priority_key(item):
               p = item[1].lower()
-              if any(k in p for k in ['menu', 'black', 'idle', 'hover', 'logo']):
+              # Prioritize UI/menus AND videos first so video cutscenes never stall or 404
+              if any(k in p for k in ['menu', 'black', 'idle', 'hover', 'logo']) or p.endswith('.webm'):
                   return (0, 0, natural_tokens(p))
               if p in rank_map:
                   return (1, rank_map[p], natural_tokens(p))
@@ -627,7 +654,6 @@ jobs:
               hud._t = setTimeout(() => { if (hud) hud.style.opacity = '0.2'; }, 2500);
             }
 
-            // Case-insensitive lookup map so Windows mixed-case asset paths always match
             const SUFFIX_MAP = new Map();
             for (const [k, chunk] of Object.entries(MANIFEST)) {
               const lk = k.toLowerCase();
@@ -712,8 +738,10 @@ jobs:
                     const slicedAb = data.buffer.slice(data.byteOffset, data.byteOffset + data.byteLength);
                     fileMap.set(path, { bytes: data, ab: slicedAb });
                     totalSize += data.byteLength;
-                    // Write ALL files (including .webm videos) into Emscripten FS so Ren'Py finds them immediately
                     writeToEmscriptenFS(path, data);
+                    if (path.match(/\\.(webm|mp4|mkv|ogv|avi|mov)$/i) && !blobUrlCache.has(path)) {
+                      blobUrlCache.set(path, URL.createObjectURL(new Blob([data], { type: 'video/webm' })));
+                    }
                   }
                   evictIfNeeded(totalSize);
                   const entry = { files: fileMap, size: totalSize, lastUsed: Date.now() };
@@ -772,6 +800,13 @@ jobs:
               if (!info) return false;
               const target = (el instanceof HTMLSourceElement && el.parentElement) ? el.parentElement : el;
               target._pendingStreamInfo = info;
+              if (blobUrlCache.has(info.key)) {
+                const bUrl = blobUrlCache.get(info.key);
+                if (el instanceof HTMLSourceElement) origSrcDesc.set.call(el, bUrl);
+                origSrcDesc.set.call(target, bUrl);
+                origMediaLoad.call(target);
+                return true;
+              }
               getVideoBlobUrl(info).then(bUrl => {
                 if (bUrl && target._pendingStreamInfo === info) {
                   if (el instanceof HTMLSourceElement) origSrcDesc.set.call(el, bUrl);
@@ -816,7 +851,7 @@ jobs:
               return origMediaLoad.apply(this, arguments);
             };
 
-            for (let i = 0; i < Math.min(4, ALL_CHUNKS.length); i++) {
+            for (let i = 0; i < Math.min(6, ALL_CHUNKS.length); i++) {
               loadChunk(ALL_CHUNKS[i], false, 4).catch(() => {});
             }
 
