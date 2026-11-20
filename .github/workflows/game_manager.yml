@@ -171,9 +171,9 @@ jobs:
             RENPY_VER="8.5.0"
             wget -q "https://www.renpy.org/dl/${RENPY_VER}/renpy-${RENPY7_VER}-sdk.tar.bz2" 2>/dev/null || true
             wget -q "https://www.renpy.org/dl/${RENPY_VER}/renpy-${RENPY_VER}-sdk.tar.bz2"
-            tar -xjf "renpy-${RENPY_VER}-sdk.tar.bz2"
-            mv "renpy-${RENPY_VER}-sdk" toolchain/renpy_sdk
-            rm -f "renpy-${RENPY_VER}-sdk.tar.bz2"
+            tar -xjf "renpy-${RENPY7_VER}-sdk.tar.bz2"
+            mv "renpy-${RENPY7_VER}-sdk" toolchain/renpy_sdk
+            rm -f "renpy-${RENPY7_VER}-sdk.tar.bz2"
 
             wget -q "https://www.renpy.org/dl/${RENPY_VER}/renpy-${RENPY_VER}-web.zip"
             unzip -q "renpy-${RENPY_VER}-web.zip" -d temp_web/
@@ -431,6 +431,15 @@ jobs:
               fi
             done
 
+            # Normalize problematic MP3s to standard 44.1kHz stereo so WebAudio never throws EncodingError
+            find game_src/game -type f -iname "*.mp3" | while read -r amp3; do
+              if ffmpeg -nostdin -y -i "$amp3" -ar 44100 -ac 2 -c:a libmp3lame -b:a 192k "${amp3}.norm.mp3" >/dev/null 2>&1; then
+                [ -s "${amp3}.norm.mp3" ] && mv "${amp3}.norm.mp3" "$amp3" || rm -f "${amp3}.norm.mp3"
+              else
+                rm -f "${amp3}.norm.mp3"
+              fi
+            done
+
             find game_src/game -type f -name "*.rpy" -exec sed -i -E 's/\.(mp4|mkv|avi|mov|ogv)(["'\''])/.webm\2/gi' {} +
 
             rm -f game_src/game/progressive_download.txt
@@ -446,11 +455,13 @@ jobs:
             fi
             rm -rf game_src trace_story.py web_build.log
 
+            # Extract media & videos into chunks; also offload >2MB non-UI assets if game.zip is huge
             python3 - << 'SPLITZIP'
           import zipfile, os
 
           gzip_path = "web_out/game.zip"
           if os.path.exists(gzip_path):
+              large_zip = os.path.getsize(gzip_path) > (60 * 1024 * 1024)
               tmp_zip = gzip_path + ".clean"
               with zipfile.ZipFile(gzip_path, 'r') as zin:
                   existing_names = set(zin.namelist())
@@ -465,8 +476,9 @@ jobs:
                           is_video = low.endswith(('.webm', '.mp4', '.mkv', '.ogv', '.avi', '.mov'))
                           is_media = low.endswith(('.png', '.jpg', '.jpeg', '.webp', '.avif', '.ogg', '.mp3', '.wav'))
                           is_core_ui = ('gui/' in low or 'window_icon' in low or 'presplash' in low or '_placeholders/' in low)
+                          is_oversized_asset = (large_zip and not is_core_ui and not low.endswith(('.rpy', '.rpyc', '.txt', '.json', '.ttf', '.otf')) and item.file_size > (2 * 1024 * 1024))
 
-                          if is_video or (is_media and not is_core_ui):
+                          if is_video or (is_media and not is_core_ui) or is_oversized_asset:
                               dest_rel = fn if fn.startswith('game/') else ('game/' + fn)
                               dest_path = os.path.join("web_out", dest_rel)
                               os.makedirs(os.path.dirname(dest_path), exist_ok=True)
@@ -622,10 +634,13 @@ jobs:
             }
 
             const SUFFIX_MAP = new Map();
+            const BASENAME_MAP = new Map();
             for (const [k, chunk] of Object.entries(MANIFEST)) {
               const lk = k.toLowerCase();
               SUFFIX_MAP.set('/' + lk, { key: k, chunk });
               if (lk.startsWith('game/')) SUFFIX_MAP.set('/' + lk.slice(5), { key: k, chunk });
+              const bn = lk.split('/').pop();
+              if (bn && !BASENAME_MAP.has(bn)) BASENAME_MAP.set(bn, { key: k, chunk });
             }
 
             function resolveAsset(rawUrl) {
@@ -636,6 +651,8 @@ jobs:
               for (const [suffix, info] of SUFFIX_MAP.entries()) {
                 if (cleanPath.endsWith(suffix)) return info;
               }
+              const bn = cleanPath.split('/').pop();
+              if (bn && BASENAME_MAP.has(bn)) return BASENAME_MAP.get(bn);
               return null;
             }
 
@@ -694,6 +711,16 @@ jobs:
 
             const origFetch = window.fetch.bind(window);
 
+            async function fetchWithRetry(url, retries = 2) {
+              for (let attempt = 0; attempt <= retries; attempt++) {
+                const res = await origFetch(url);
+                if (res.ok || (res.status !== 503 && res.status !== 429) || attempt === retries) {
+                  return res;
+                }
+                await new Promise(r => setTimeout(r, 300 * (attempt + 1)));
+              }
+            }
+
             async function loadChunk(chunkName, isUrgent = false, preloadAhead = 4) {
               if (fifoCache.has(chunkName)) {
                 const entry = fifoCache.get(chunkName);
@@ -708,7 +735,8 @@ jobs:
 
               const promise = (async () => {
                 try {
-                  const res = await origFetch(BASE_URL + "/" + chunkName);
+                  const res = await fetchWithRetry(BASE_URL + "/" + chunkName, 2);
+                  if (!res || !res.ok) return null;
                   const ab = await res.arrayBuffer();
                   const unzipped = await unzipAsync(new Uint8Array(ab));
                   const fileMap = new Map();
@@ -796,7 +824,7 @@ jobs:
                   origMediaLoad.call(target);
                   target.play().catch(() => {});
                 }
-              });
+              }).catch(() => {});
               return true;
             }
 
