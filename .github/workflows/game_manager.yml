@@ -38,16 +38,29 @@ jobs:
 
           if [ -n "$TG_TOKEN" ] && [ -n "$TG_CHAT" ]; then
             python3 - << 'TGPY'
-          import os, html, urllib.request, json
+          import os, html, urllib.request, urllib.error, json
+
+          def send_tg_safe(text, disable_preview=True):
+              token = os.environ.get("TG_TOKEN", "").strip()
+              chat_id = os.environ.get("TG_CHAT", "").strip()
+              if not token or not chat_id:
+                  return
+              url = f"https://api.telegram.org/bot{token}/sendMessage"
+              for i in range(0, max(1, len(text)), 3500):
+                  part = text[i:i+3500]
+                  payload = {"chat_id": chat_id, "text": part, "disable_web_page_preview": disable_preview}
+                  if part.count("<b>") == part.count("</b>") and part.count("<code>") == part.count("</code>") and part.count("<pre>") == part.count("</pre>"):
+                      payload["parse_mode"] = "HTML"
+                  req = urllib.request.Request(url, data=json.dumps(payload).encode("utf-8"), headers={"Content-Type": "application/json"})
+                  try:
+                      urllib.request.urlopen(req, timeout=20)
+                  except urllib.error.HTTPError as e:
+                      print(f"Telegram HTTP error: {e.code} -> {e.read().decode('utf-8', errors='ignore')}")
+
           list_out = html.escape(os.environ.get("LIST_OUT", "").strip())
           comma_out = html.escape(os.environ.get("COMMA_OUT", "").strip())
           msg = "📂 <b>Google Drive (gdrive:Games):</b>\n\n" + (f"<pre>{list_out}</pre>\n\n📋 <b>Copy-Paste Build Command:</b>\n<code>/build {comma_out}</code>" if list_out else "<i>No archives found.</i>")
-          req = urllib.request.Request(
-              f"https://api.telegram.org/bot{os.environ['TG_TOKEN']}/sendMessage",
-              data=json.dumps({"chat_id": os.environ["TG_CHAT"], "text": msg[:4000], "parse_mode": "HTML"}).encode(),
-              headers={"Content-Type": "application/json"}
-          )
-          urllib.request.urlopen(req)
+          send_tg_safe(msg, disable_preview=True)
           TGPY
           fi
 
@@ -61,7 +74,24 @@ jobs:
           TG_CHAT: ${{ secrets.TELEGRAM_CHAT_ID }}
         run: |
           python3 - << 'STATPY'
-          import os, html, urllib.request, json, shutil, subprocess
+          import os, html, urllib.request, urllib.error, json, shutil, subprocess
+
+          def send_tg_safe(text, disable_preview=True):
+              token = os.environ.get("TG_TOKEN", "").strip()
+              chat_id = os.environ.get("TG_CHAT", "").strip()
+              if not token or not chat_id:
+                  return
+              url = f"https://api.telegram.org/bot{token}/sendMessage"
+              for i in range(0, max(1, len(text)), 3500):
+                  part = text[i:i+3500]
+                  payload = {"chat_id": chat_id, "text": part, "disable_web_page_preview": disable_preview}
+                  if part.count("<b>") == part.count("</b>") and part.count("<code>") == part.count("</code>") and part.count("<pre>") == part.count("</pre>"):
+                      payload["parse_mode"] = "HTML"
+                  req = urllib.request.Request(url, data=json.dumps(payload).encode("utf-8"), headers={"Content-Type": "application/json"})
+                  try:
+                      urllib.request.urlopen(req, timeout=20)
+                  except urllib.error.HTTPError as e:
+                      print(f"Telegram HTTP error: {e.code} -> {e.read().decode('utf-8', errors='ignore')}")
 
           default_pods = [{"name": "pod-0", "repo": os.environ["REPO_NAME"], "pages_base": f"https://hola41242.github.io/{os.environ['REPO_NAME'].split('/')[-1]}", "max_mb": 850}]
           raw_pods = os.environ.get("POD_TARGETS_JSON", "").strip()
@@ -120,14 +150,7 @@ jobs:
               f"🎮 <b>Ready Builds ({total_games}):</b>\n{body}"
           )
           print(msg)
-
-          if os.environ.get("TG_TOKEN") and os.environ.get("TG_CHAT"):
-              req = urllib.request.Request(
-                  f"https://api.telegram.org/bot{os.environ['TG_TOKEN']}/sendMessage",
-                  data=json.dumps({"chat_id": os.environ["TG_CHAT"], "text": msg[:4000], "parse_mode": "HTML", "disable_web_page_preview": True}).encode(),
-                  headers={"Content-Type": "application/json"}
-              )
-              urllib.request.urlopen(req)
+          send_tg_safe(msg, disable_preview=True)
           STATPY
 
       - name: Delete Specific Games Across Pods (DELETE)
