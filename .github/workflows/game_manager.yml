@@ -241,7 +241,7 @@ jobs:
 
             RENPY_VER="8.5.0"
             wget -q "https://www.renpy.org/dl/${RENPY_VER}/renpy-${RENPY7_VER}-sdk.tar.bz2" 2>/dev/null || true
-            wget -q "https://www.renpy.org/dl/${RENPY_VER}/renpy-${RENPY7_VER}-sdk.tar.bz2"
+            wget -q "https://www.renpy.org/dl/${RENPY_VER}/renpy-${RENPY_VER}-sdk.tar.bz2"
             tar -xjf "renpy-${RENPY7_VER}-sdk.tar.bz2" 2>/dev/null || true
             tar -xjf "renpy-${RENPY7_VER}-sdk.tar.bz2"
             mv "renpy-${RENPY7_VER}-sdk" toolchain/renpy_sdk
@@ -690,7 +690,6 @@ jobs:
                 rm -rf web_out chunks_out script_order.json
                 continue
               fi
-              # GitHub standard git push rejects single files > 100MB; split into release parts if > 90MB
               if [ "$GZIP_SIZE" -gt 94371840 ]; then
                 SPLIT_GAME_ZIP="1"
               fi
@@ -797,11 +796,23 @@ jobs:
             echo "Assigned $SLUG -> $POD_NAME ($POD_REPO)"
 
             GH_TOKEN="$GH_TOKEN" gh release delete "$TAG" --repo "$POD_REPO" --yes --cleanup-tag 2>&1 || true
-            if ! GH_TOKEN="$GH_TOKEN" gh release create "$TAG" --repo "$POD_REPO" --title "Progressive Stream: $SLUG" --notes "Script-ordered 10MB zero-blur chunks" 2>&1; then
+            sleep 2
+            GH_TOKEN="$GH_TOKEN" git ls-remote --tags "https://x-access-token:${GH_TOKEN}@github.com/${POD_REPO}.git" "refs/tags/${TAG}" >/dev/null 2>&1 && \
+              GH_TOKEN="$GH_TOKEN" git push --delete "https://x-access-token:${GH_TOKEN}@github.com/${POD_REPO}.git" "refs/tags/${TAG}" >/dev/null 2>&1 || true
+
+            if ! GH_TOKEN="$GH_TOKEN" gh release view "$TAG" --repo "$POD_REPO" >/dev/null 2>&1; then
+              if ! GH_TOKEN="$GH_TOKEN" gh release create "$TAG" --repo "$POD_REPO" --title "Progressive Stream: $SLUG" --notes "Script-ordered 10MB zero-blur chunks" 2>&1; then
+                sleep 2
+                GH_TOKEN="$GH_TOKEN" gh release create "$TAG" --repo "$POD_REPO" --title "Progressive Stream: $SLUG" --notes "Script-ordered 10MB zero-blur chunks" 2>&1 || true
+              fi
+            fi
+
+            if ! GH_TOKEN="$GH_TOKEN" gh release view "$TAG" --repo "$POD_REPO" >/dev/null 2>&1; then
               notify_tg "⚠️ Failed & Skipped: $ARCHIVE (GitHub Release create error on $POD_NAME)"
               rm -rf web_out chunks_out pack_chunks.py
               continue
             fi
+
             if ls chunks_out/*.zip chunks_out/*.bin 1> /dev/null 2>&1; then
               if ! GH_TOKEN="$GH_TOKEN" gh release upload "$TAG" chunks_out/* --repo "$POD_REPO" --clobber 2>&1; then
                 notify_tg "⚠️ Failed & Skipped: $ARCHIVE (GitHub Release upload error on $POD_NAME)"
