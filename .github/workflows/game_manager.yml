@@ -241,11 +241,11 @@ jobs:
 
             RENPY_VER="8.5.0"
             wget -q "https://www.renpy.org/dl/${RENPY_VER}/renpy-${RENPY7_VER}-sdk.tar.bz2" 2>/dev/null || true
-            wget -q "https://www.renpy.org/dl/${RENPY_VER}/renpy-${RENPY_VER}-sdk.tar.bz2"
+            wget -q "https://www.renpy.org/dl/${RENPY_VER}/renpy-${RENPY7_VER}-sdk.tar.bz2"
             tar -xjf "renpy-${RENPY7_VER}-sdk.tar.bz2" 2>/dev/null || true
-            tar -xjf "renpy-${RENPY_VER}-sdk.tar.bz2"
-            mv "renpy-${RENPY_VER}-sdk" toolchain/renpy_sdk
-            rm -f "renpy-${RENPY_VER}-sdk.tar.bz2"
+            tar -xjf "renpy-${RENPY7_VER}-sdk.tar.bz2"
+            mv "renpy-${RENPY7_VER}-sdk" toolchain/renpy_sdk
+            rm -f "renpy-${RENPY7_VER}-sdk.tar.bz2"
 
             wget -q "https://www.renpy.org/dl/${RENPY_VER}/renpy-${RENPY_VER}-web.zip"
             unzip -q "renpy-${RENPY_VER}-web.zip" -d temp_web/
@@ -342,6 +342,8 @@ jobs:
                   games = [d for d in os.listdir(pdir) if os.path.isdir(os.path.join(pdir, d)) and not d.startswith('.') and os.path.exists(os.path.join(pdir, d, "index.html"))]
                   used = sum(dir_size(os.path.join(pdir, g)) for g in games)
                   if used + incoming_bytes <= max_bytes:
+                      return idx, pod, pdir
+                  if len(games) == 0:
                       return idx, pod, pdir
               return None
 
@@ -659,9 +661,9 @@ jobs:
 
             if [ -f "web_out/game.zip" ]; then
               GZIP_SIZE=$(stat -c%s "web_out/game.zip")
-              if [ "$GZIP_SIZE" -gt 99614720 ]; then
+              if [ "$GZIP_SIZE" -gt 157286400 ]; then
                 GZIP_MB=$((GZIP_SIZE / 1048576))
-                notify_tg "⚠️ Failed & Skipped: $ARCHIVE (game.zip is ${GZIP_MB}MB > 95MB GitHub file limit)"
+                notify_tg "⚠️ Failed & Skipped: $ARCHIVE (game.zip is ${GZIP_MB}MB > 150MB limit)"
                 rm -rf web_out chunks_out script_order.json
                 continue
               fi
