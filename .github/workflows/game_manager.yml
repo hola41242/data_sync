@@ -248,11 +248,11 @@ jobs:
             rm -f "renpy-${RENPY7_VER}-sdk.tar.bz2"
 
             wget -q "https://www.renpy.org/dl/${RENPY_VER}/renpy-${RENPY_VER}-web.zip"
-            unzip -q "renpy-${RENPY_VER}-web.zip" -d temp_web/
+            unzip -q "renpy-${RENPY7_VER}-web.zip" -d temp_web/
             mkdir -p toolchain/renpy_sdk/web
             WEB_INNER=$(dirname "$(find temp_web -name "index.html" | head -n 1)")
             cp -r "$WEB_INNER"/* toolchain/renpy_sdk/web/
-            rm -rf temp_web "renpy-${RENPY_VER}-web.zip"
+            rm -rf temp_web "renpy-${RENPY7_VER}-web.zip"
 
             tar -cf /tmp/renpy_toolchain.tar toolchain
             rclone copyto /tmp/renpy_toolchain.tar gdrive:Tools/renpy_toolchain.tar --multi-thread-streams 8 --drive-chunk-size 128M
@@ -899,6 +899,12 @@ jobs:
               return null;
             }
 
+            function isGameZipRequest(rawUrl) {
+              if (!rawUrl || typeof rawUrl !== 'string' || GAME_ZIP_PARTS.length === 0) return false;
+              const cleanPath = rawUrl.split('?')[0].split('#')[0].toLowerCase();
+              return cleanPath.endsWith('/game.zip');
+            }
+
             function writeToEmscriptenFS(relPath, uint8Data) {
               try {
                 const FS = (window.Module && window.Module.FS) || window.FS;
@@ -1044,24 +1050,29 @@ jobs:
               return bUrl;
             }
 
-            async function fetchSplitGameZip() {
-              const buffers = [];
-              let totalLen = 0;
-              for (const part of GAME_ZIP_PARTS) {
-                updateHud(`Loading ${part}...`);
-                const res = await fetchWithRetry(BASE_URL + "/" + part, 2);
-                if (!res || !res.ok) return null;
-                const ab = await res.arrayBuffer();
-                buffers.push(ab);
-                totalLen += ab.byteLength;
-              }
-              const merged = new Uint8Array(totalLen);
-              let offset = 0;
-              for (const ab of buffers) {
-                merged.set(new Uint8Array(ab), offset);
-                offset += ab.byteLength;
-              }
-              return new Response(merged.buffer, { status: 200, headers: { 'Content-Type': 'application/zip' } });
+            let mergedGameZipPromise = null;
+            async function getMergedGameZipBytes() {
+              if (mergedGameZipPromise) return mergedGameZipPromise;
+              mergedGameZipPromise = (async () => {
+                const buffers = [];
+                let totalLen = 0;
+                for (const part of GAME_ZIP_PARTS) {
+                  updateHud(`Loading ${part}...`);
+                  const res = await fetchWithRetry(BASE_URL + "/" + part, 2);
+                  if (!res || !res.ok) return null;
+                  const ab = await res.arrayBuffer();
+                  buffers.push(ab);
+                  totalLen += ab.byteLength;
+                }
+                const merged = new Uint8Array(totalLen);
+                let offset = 0;
+                for (const ab of buffers) {
+                  merged.set(new Uint8Array(ab), offset);
+                  offset += ab.byteLength;
+                }
+                return merged;
+              })();
+              return mergedGameZipPromise;
             }
 
             const mediaProto = HTMLMediaElement.prototype;
@@ -1136,9 +1147,9 @@ jobs:
 
             window.fetch = async function(resource, init) {
               const rawUrl = (typeof resource === 'string') ? resource : (resource && resource.url) || '';
-              if (GAME_ZIP_PARTS.length > 0 && rawUrl.split('?')[0].split('#')[0].toLowerCase().endsWith('/game.zip')) {
-                const splitResp = await fetchSplitGameZip();
-                if (splitResp) return splitResp;
+              if (isGameZipRequest(rawUrl)) {
+                const merged = await getMergedGameZipBytes();
+                if (merged) return new Response(merged.buffer, { status: 200, headers: { 'Content-Type': 'application/zip' } });
               }
               const info = resolveAsset(rawUrl);
               if (info) {
@@ -1151,13 +1162,39 @@ jobs:
             const origOpen = XMLHttpRequest.prototype.open;
             const origSend = XMLHttpRequest.prototype.send;
             XMLHttpRequest.prototype.open = function(method, url) {
+              this._isGameZip = isGameZipRequest(url);
               this._streamInfo = resolveAsset(url);
               return origOpen.apply(this, arguments);
             };
             XMLHttpRequest.prototype.send = function(body) {
+              const xhr = this;
+              if (xhr._isGameZip) {
+                getMergedGameZipBytes().then(merged => {
+                  if (!merged) {
+                    Object.defineProperty(xhr, 'status', { value: 404, configurable: true });
+                    Object.defineProperty(xhr, 'readyState', { value: 4, configurable: true });
+                    xhr.dispatchEvent(new Event('readystatechange'));
+                    xhr.dispatchEvent(new Event('error'));
+                    return;
+                  }
+                  const ab = merged.buffer.slice(merged.byteOffset, merged.byteOffset + merged.byteLength);
+                  let respVal = ab;
+                  if (xhr.responseType === 'blob') respVal = new Blob([merged], { type: 'application/zip' });
+                  else if (xhr.responseType === 'text' || xhr.responseType === '') respVal = new TextDecoder().decode(merged);
+                  else if (xhr.responseType === 'json') respVal = JSON.parse(new TextDecoder().decode(merged));
+                  Object.defineProperty(xhr, 'status', { value: 200, configurable: true });
+                  Object.defineProperty(xhr, 'statusText', { value: 'OK', configurable: true });
+                  Object.defineProperty(xhr, 'readyState', { value: 4, configurable: true });
+                  Object.defineProperty(xhr, 'response', { value: respVal, configurable: true });
+                  if (xhr.responseType === '' || xhr.responseType === 'text') Object.defineProperty(xhr, 'responseText', { value: respVal, configurable: true });
+                  xhr.dispatchEvent(new Event('readystatechange'));
+                  xhr.dispatchEvent(new Event('load'));
+                  xhr.dispatchEvent(new Event('loadend'));
+                });
+                return;
+              }
               const info = this._streamInfo;
               if (!info) return origSend.apply(this, arguments);
-              const xhr = this;
               getAssetRecord(info).then(rec => {
                 if (!rec) {
                   Object.defineProperty(xhr, 'status', { value: 404, configurable: true });
