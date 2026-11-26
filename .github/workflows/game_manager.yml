@@ -4,7 +4,7 @@ on:
   workflow_dispatch:
     inputs:
       target_archive:
-        description: 'LIST | STATUS [sync|sync_1..5] | [sync|sync_1..5]: game.zip | DELETE: slug'
+        description: 'LIST | STATUS [sync|sync_1..5] | [sync|sync_1..5] <games> | DELETE: slug'
         required: true
         default: 'STATUS'
 
@@ -641,11 +641,13 @@ jobs:
               os.replace(tmp_zip, gzip_path)
           SPLITZIP
 
-            SPLIT_GAME_ZIP="0"
             if [ -f "web_out/game.zip" ]; then
               GZIP_SIZE=$(stat -c%s "web_out/game.zip")
-              if [ "$GZIP_SIZE" -gt 94371840 ]; then
-                SPLIT_GAME_ZIP="1"
+              if [ "$GZIP_SIZE" -gt 99614720 ]; then
+                GZIP_MB=$((GZIP_SIZE / 1048576))
+                notify_tg "⚠️ Failed & Skipped: $ARCHIVE on $TARGET_LABEL (game.zip is ${GZIP_MB}MB > 95MB GitHub push safe limit)"
+                rm -rf web_out chunks_out script_order.json
+                continue
               fi
             fi
 
@@ -712,28 +714,11 @@ jobs:
           if os.path.exists(prog_dir):
               shutil.rmtree(prog_dir)
 
-          game_zip_parts = []
-          gzip_path = "web_out/game.zip"
-          if os.environ.get("SPLIT_GAME_ZIP") == "1" and os.path.exists(gzip_path):
-              part_size = 50 * 1024 * 1024
-              p_idx = 0
-              with open(gzip_path, "rb") as gf:
-                  while True:
-                      buf = gf.read(part_size)
-                      if not buf:
-                          break
-                      pname = f"gamezip_part_{p_idx:03d}.bin"
-                      with open(os.path.join(chunks_dir, pname), "wb") as pf:
-                          pf.write(buf)
-                      game_zip_parts.append(pname)
-                      p_idx += 1
-              os.remove(gzip_path)
-
           with open("web_out/stream_manifest.json", "w", encoding="utf-8") as f:
-              json.dump({"manifest": manifest, "game_zip_parts": game_zip_parts}, f)
+              json.dump(manifest, f)
           PYSCRIPT
 
-            SPLIT_GAME_ZIP="$SPLIT_GAME_ZIP" python3 pack_chunks.py
+            python3 pack_chunks.py
             rm -f script_order.json
 
             GH_TOKEN="$GH_TOKEN" gh release delete "$TAG" --repo "$TARGET_REPO" --yes --cleanup-tag 2>&1 || true
@@ -751,8 +736,8 @@ jobs:
               continue
             fi
 
-            if ls chunks_out/*.zip chunks_out/*.bin 1> /dev/null 2>&1; then
-              if ! GH_TOKEN="$GH_TOKEN" gh release upload "$TAG" chunks_out/* --repo "$TARGET_REPO" --clobber 2>&1; then
+            if ls chunks_out/chunk_*.zip 1> /dev/null 2>&1; then
+              if ! GH_TOKEN="$GH_TOKEN" gh release upload "$TAG" chunks_out/chunk_*.zip --repo "$TARGET_REPO" --clobber 2>&1; then
                 notify_tg "⚠️ Failed & Skipped: $ARCHIVE on $TARGET_LABEL (GitHub Release upload error)"
                 rm -rf web_out chunks_out pack_chunks.py
                 continue
@@ -769,14 +754,7 @@ jobs:
           base_url = worker + "/?url=https://github.com/" + repo + "/releases/download/" + tag
 
           with open("web_out/stream_manifest.json", "r", encoding="utf-8") as f:
-              raw_data = json.load(f)
-
-          if isinstance(raw_data, dict) and "manifest" in raw_data:
-              manifest = raw_data["manifest"]
-              game_zip_parts = raw_data.get("game_zip_parts", [])
-          else:
-              manifest = raw_data
-              game_zip_parts = []
+              manifest = json.load(f)
 
           chunks = sorted(list(set(manifest.values())))
 
@@ -797,7 +775,6 @@ jobs:
             const BASE_URL = __BASE_URL__;
             const MANIFEST = __MANIFEST__;
             const ALL_CHUNKS = __CHUNKS__;
-            const GAME_ZIP_PARTS = __GAME_ZIP_PARTS__;
             const MAX_BUFFER_BYTES = 384 * 1024 * 1024;
 
             let hud = null;
@@ -835,12 +812,6 @@ jobs:
               const bn = cleanPath.split('/').pop();
               if (bn && BASENAME_MAP.has(bn)) return BASENAME_MAP.get(bn);
               return null;
-            }
-
-            function isGameZipRequest(rawUrl) {
-              if (!rawUrl || typeof rawUrl !== 'string' || GAME_ZIP_PARTS.length === 0) return false;
-              const cleanPath = rawUrl.split('?')[0].split('#')[0].toLowerCase();
-              return cleanPath === 'game.zip' || cleanPath.endsWith('/game.zip');
             }
 
             function writeToEmscriptenFS(relPath, uint8Data) {
@@ -986,31 +957,6 @@ jobs:
               return bUrl;
             }
 
-            let mergedGameZipPromise = null;
-            async function getMergedGameZipBytes() {
-              if (mergedGameZipPromise) return mergedGameZipPromise;
-              mergedGameZipPromise = (async () => {
-                const buffers = [];
-                let totalLen = 0;
-                for (const part of GAME_ZIP_PARTS) {
-                  updateHud(`Loading ${part}...`);
-                  const res = await fetchWithRetry(BASE_URL + "/" + part, 2);
-                  if (!res || !res.ok) return null;
-                  const ab = await res.arrayBuffer();
-                  buffers.push(ab);
-                  totalLen += ab.byteLength;
-                }
-                const merged = new Uint8Array(totalLen);
-                let offset = 0;
-                for (const ab of buffers) {
-                  merged.set(new Uint8Array(ab), offset);
-                  offset += ab.byteLength;
-                }
-                return merged;
-              })();
-              return mergedGameZipPromise;
-            }
-
             const mediaProto = HTMLMediaElement.prototype;
             const origSrcDesc = Object.getOwnPropertyDescriptor(mediaProto, 'src');
             const origSetAttr = Element.prototype.setAttribute;
@@ -1079,10 +1025,6 @@ jobs:
 
             window.fetch = async function(resource, init) {
               const rawUrl = (typeof resource === 'string') ? resource : (resource && resource.url) || '';
-              if (isGameZipRequest(rawUrl)) {
-                const merged = await getMergedGameZipBytes();
-                if (merged) return new Response(merged.buffer, { status: 200, headers: { 'Content-Type': 'application/zip' } });
-              }
               const info = resolveAsset(rawUrl);
               if (info) {
                 const rec = await getAssetRecord(info);
@@ -1094,39 +1036,13 @@ jobs:
             const origOpen = XMLHttpRequest.prototype.open;
             const origSend = XMLHttpRequest.prototype.send;
             XMLHttpRequest.prototype.open = function(method, url) {
-              this._isGameZip = isGameZipRequest(url);
               this._streamInfo = resolveAsset(url);
               return origOpen.apply(this, arguments);
             };
             XMLHttpRequest.prototype.send = function(body) {
-              const xhr = this;
-              if (xhr._isGameZip) {
-                getMergedGameZipBytes().then(merged => {
-                  if (!merged) {
-                    Object.defineProperty(xhr, 'status', { value: 404, configurable: true });
-                    Object.defineProperty(xhr, 'readyState', { value: 4, configurable: true });
-                    xhr.dispatchEvent(new Event('readystatechange'));
-                    xhr.dispatchEvent(new Event('error'));
-                    return;
-                  }
-                  const ab = merged.buffer.slice(merged.byteOffset, merged.byteOffset + merged.byteLength);
-                  let respVal = ab;
-                  if (xhr.responseType === 'blob') respVal = new Blob([merged], { type: 'application/zip' });
-                  else if (xhr.responseType === 'text' || xhr.responseType === '') respVal = new TextDecoder().decode(merged);
-                  else if (xhr.responseType === 'json') respVal = JSON.parse(new TextDecoder().decode(merged));
-                  Object.defineProperty(xhr, 'status', { value: 200, configurable: true });
-                  Object.defineProperty(xhr, 'statusText', { value: 'OK', configurable: true });
-                  Object.defineProperty(xhr, 'readyState', { value: 4, configurable: true });
-                  Object.defineProperty(xhr, 'response', { value: respVal, configurable: true });
-                  if (xhr.responseType === '' || xhr.responseType === 'text') Object.defineProperty(xhr, 'responseText', { value: respVal, configurable: true });
-                  xhr.dispatchEvent(new Event('readystatechange'));
-                  xhr.dispatchEvent(new Event('load'));
-                  xhr.dispatchEvent(new Event('loadend'));
-                });
-                return;
-              }
               const info = this._streamInfo;
               if (!info) return origSend.apply(this, arguments);
+              const xhr = this;
               getAssetRecord(info).then(rec => {
                 if (!rec) {
                   Object.defineProperty(xhr, 'status', { value: 404, configurable: true });
@@ -1156,8 +1072,7 @@ jobs:
           hook = (js_template
                   .replace("__BASE_URL__", json.dumps(base_url))
                   .replace("__MANIFEST__", json.dumps(manifest))
-                  .replace("__CHUNKS__", json.dumps(chunks))
-                  .replace("__GAME_ZIP_PARTS__", json.dumps(game_zip_parts)))
+                  .replace("__CHUNKS__", json.dumps(chunks)))
 
           with open("web_out/index.html", "r", encoding="utf-8") as f:
               html = f.read()
