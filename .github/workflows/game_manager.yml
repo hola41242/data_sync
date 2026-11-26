@@ -1,10 +1,10 @@
-name: Universal RenPy Lossless Web Streamer (Telegram + Multi-Pod)
+name: Universal RenPy Lossless Web Streamer (sync / sync_1..5)
 
 on:
   workflow_dispatch:
     inputs:
       target_archive:
-        description: 'Enter "LIST", "STATUS", "ALL", "DELETE: slug", or comma-separated filenames'
+        description: 'LIST | STATUS [sync|sync_1..5] | [sync|sync_1..5]: game.zip | DELETE: slug'
         required: true
         default: 'STATUS'
 
@@ -59,22 +59,23 @@ jobs:
 
           list_out = html.escape(os.environ.get("LIST_OUT", "").strip())
           comma_out = html.escape(os.environ.get("COMMA_OUT", "").strip())
-          msg = "📂 <b>Google Drive (gdrive:Games):</b>\n\n" + (f"<pre>{list_out}</pre>\n\n📋 <b>Copy-Paste Build Command:</b>\n<code>/build {comma_out}</code>" if list_out else "<i>No archives found.</i>")
+          msg = "📂 <b>Google Drive (gdrive:Games):</b>\n\n" + (f"<pre>{list_out}</pre>\n\n📋 <b>Copy-Paste Build Command:</b>\n<code>/build sync {comma_out}</code>" if list_out else "<i>No archives found.</i>")
           send_tg_safe(msg, disable_preview=True)
           TGPY
           fi
 
-      - name: Check Storage & Ready Builds Across All Pods (STATUS)
-        if: ${{ github.event.inputs.target_archive == 'STATUS' || github.event.inputs.target_archive == 'status' }}
+      - name: Check Storage & Ready Builds (STATUS / STATUS sync..sync_5)
+        if: ${{ startsWith(github.event.inputs.target_archive, 'STATUS') || startsWith(github.event.inputs.target_archive, 'status') }}
         env:
           GH_TOKEN: ${{ secrets.GH_PAT || secrets.GITHUB_TOKEN }}
           REPO_NAME: ${{ github.repository }}
           POD_TARGETS_JSON: ${{ secrets.POD_TARGETS_JSON }}
+          TARGET: ${{ github.event.inputs.target_archive }}
           TG_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TG_CHAT: ${{ secrets.TELEGRAM_CHAT_ID }}
         run: |
           python3 - << 'STATPY'
-          import os, html, urllib.request, urllib.error, json, shutil, subprocess
+          import os, re, html, urllib.request, urllib.error, json, shutil, subprocess
 
           def send_tg_safe(text, disable_preview=True):
               token = os.environ.get("TG_TOKEN", "").strip()
@@ -93,10 +94,35 @@ jobs:
                   except urllib.error.HTTPError as e:
                       print(f"Telegram HTTP error: {e.code} -> {e.read().decode('utf-8', errors='ignore')}")
 
-          default_pods = [{"name": "pod-0", "repo": os.environ["REPO_NAME"], "pages_base": f"https://hola41242.github.io/{os.environ['REPO_NAME'].split('/')[-1]}", "max_mb": 850}]
+          default_pods = [
+              {"name": "sync", "repo": os.environ["REPO_NAME"], "pages_base": f"https://hola41242.github.io/{os.environ['REPO_NAME'].split('/')[-1]}", "max_mb": 850},
+              {"name": "sync_1", "repo": "hola41242/data_sync_1", "pages_base": "https://hola41242.github.io/data_sync_1", "max_mb": 850},
+              {"name": "sync_2", "repo": "hola41242/data_sync_2", "pages_base": "https://hola41242.github.io/data_sync_2", "max_mb": 850},
+              {"name": "sync_3", "repo": "hola41242/data_sync_3", "pages_base": "https://hola41242.github.io/data_sync_3", "max_mb": 850},
+              {"name": "sync_4", "repo": "hola41242/data_sync_4", "pages_base": "https://hola41242.github.io/data_sync_4", "max_mb": 850},
+              {"name": "sync_5", "repo": "hola41242/data_sync_5", "pages_base": "https://hola41242.github.io/data_sync_5", "max_mb": 850},
+          ]
           raw_pods = os.environ.get("POD_TARGETS_JSON", "").strip()
           pods = json.loads(raw_pods) if raw_pods else default_pods
           token = os.environ["GH_TOKEN"]
+
+          m_filter = re.match(r'^[Ss][Tt][Aa][Tt][Uu][Ss](?:\s+(.+))?$', os.environ.get("TARGET", "").strip())
+          flt = (m_filter.group(1) or "").strip().lower() if m_filter else ""
+
+          key_to_idx = {
+              "sync": 0, "pod-0": 0, "data_sync": 0,
+              "sync_1": 1, "pod-1": 1, "data_sync_1": 1,
+              "sync_2": 2, "pod-2": 2, "data_sync_2": 2,
+              "sync_3": 3, "pod-3": 3, "data_sync_3": 3,
+              "sync_4": 4, "pod-4": 4, "data_sync_4": 4,
+              "sync_5": 5, "pod-5": 5, "data_sync_5": 5,
+          }
+
+          if flt in key_to_idx and key_to_idx[flt] < len(pods):
+              i = key_to_idx[flt]
+              selected_pods = [(i, pods[i])]
+          else:
+              selected_pods = list(enumerate(pods))
 
           def dir_size(path):
               total = 0
@@ -111,8 +137,8 @@ jobs:
           total_cap_mb = 0.0
           total_games = 0
 
-          for idx, pod in enumerate(pods):
-              pname = pod.get("name", f"pod-{idx}")
+          for idx, pod in selected_pods:
+              pname = pod.get("name", f"sync_{idx}" if idx else "sync")
               prepo = pod["repo"]
               pbase = pod["pages_base"].rstrip("/")
               pmax = float(pod.get("max_mb", 850))
@@ -140,12 +166,14 @@ jobs:
               used_mb = round(p_bytes / 1048576, 1)
               free_mb = round(max(0.0, pmax - used_mb), 1)
               total_used_mb += used_mb
-              pod_lines.append(f"• <b>{html.escape(pname)}</b>: <code>{used_mb} / {pmax} MB</code> (<code>{free_mb} MB</code> free)")
+              pages_note = "" if has_branch else " <i>(no gh-pages yet)</i>"
+              pod_lines.append(f"• <b>{html.escape(pname)}</b> (<code>{html.escape(prepo)}</code>): <code>{used_mb} / {pmax} MB</code> (<code>{free_mb} MB</code> free){pages_note}")
 
           body = "\n".join(game_lines) if game_lines else "<i>No live games deployed yet.</i>"
           pods_summary = "\n".join(pod_lines)
+          title = f"Target Status: <code>{html.escape(flt)}</code>" if len(selected_pods) == 1 else "All Targets Overview"
           msg = (
-              f"📊 <b>Total Pool Quota:</b> <code>{round(total_used_mb, 1)} MB / {round(total_cap_mb, 1)} MB</code>\n"
+              f"📊 <b>{title}:</b> <code>{round(total_used_mb, 1)} MB / {round(total_cap_mb, 1)} MB</code>\n"
               f"{pods_summary}\n\n"
               f"🎮 <b>Ready Builds ({total_games}):</b>\n{body}"
           )
@@ -153,7 +181,7 @@ jobs:
           send_tg_safe(msg, disable_preview=True)
           STATPY
 
-      - name: Delete Specific Games Across Pods (DELETE)
+      - name: Delete Specific Games (DELETE)
         if: ${{ startsWith(github.event.inputs.target_archive, 'DELETE:') || startsWith(github.event.inputs.target_archive, 'delete:') }}
         env:
           GH_TOKEN: ${{ secrets.GH_PAT || secrets.GITHUB_TOKEN }}
@@ -166,7 +194,14 @@ jobs:
           python3 - << 'DELPY'
           import os, re, shutil, subprocess, json
 
-          default_pods = [{"name": "pod-0", "repo": os.environ["REPO_NAME"], "pages_base": f"https://hola41242.github.io/{os.environ['REPO_NAME'].split('/')[-1]}", "max_mb": 850}]
+          default_pods = [
+              {"name": "sync", "repo": os.environ["REPO_NAME"], "pages_base": f"https://hola41242.github.io/{os.environ['REPO_NAME'].split('/')[-1]}", "max_mb": 850},
+              {"name": "sync_1", "repo": "hola41242/data_sync_1", "pages_base": "https://hola41242.github.io/data_sync_1", "max_mb": 850},
+              {"name": "sync_2", "repo": "hola41242/data_sync_2", "pages_base": "https://hola41242.github.io/data_sync_2", "max_mb": 850},
+              {"name": "sync_3", "repo": "hola41242/data_sync_3", "pages_base": "https://hola41242.github.io/data_sync_3", "max_mb": 850},
+              {"name": "sync_4", "repo": "hola41242/data_sync_4", "pages_base": "https://hola41242.github.io/data_sync_4", "max_mb": 850},
+              {"name": "sync_5", "repo": "hola41242/data_sync_5", "pages_base": "https://hola41242.github.io/data_sync_5", "max_mb": 850},
+          ]
           raw_pods = os.environ.get("POD_TARGETS_JSON", "").strip()
           pods = json.loads(raw_pods) if raw_pods else default_pods
           token = os.environ["GH_TOKEN"]
@@ -213,11 +248,11 @@ jobs:
           if [ -n "$TG_TOKEN" ] && [ -n "$TG_CHAT" ]; then
             curl -s -X POST "https://api.telegram.org/bot${TG_TOKEN}/sendMessage" \
               -H "Content-Type: application/json" \
-              -d "{\"chat_id\":\"${TG_CHAT}\",\"text\":\"🗑️ Removed requested game(s) across pods! Send /status to verify.\"}" >/dev/null
+              -d "{\"chat_id\":\"${TG_CHAT}\",\"text\":\"🗑️ Removed requested game(s)! Send /status to verify.\"}" >/dev/null
           fi
 
       - name: Setup Toolchain (Drive Cache -> ~12s | Auto-Uploads on First Run)
-        if: ${{ github.event.inputs.target_archive != 'LIST' && github.event.inputs.target_archive != 'list' && github.event.inputs.target_archive != 'STATUS' && github.event.inputs.target_archive != 'status' && !startsWith(github.event.inputs.target_archive, 'DELETE:') && !startsWith(github.event.inputs.target_archive, 'delete:') }}
+        if: ${{ github.event.inputs.target_archive != 'LIST' && github.event.inputs.target_archive != 'list' && !startsWith(github.event.inputs.target_archive, 'STATUS') && !startsWith(github.event.inputs.target_archive, 'status') && !startsWith(github.event.inputs.target_archive, 'DELETE:') && !startsWith(github.event.inputs.target_archive, 'delete:') }}
         run: |
           if rclone lsf gdrive:Tools/renpy_toolchain.tar >/dev/null 2>&1; then
             echo "⚡ Pulling cached toolchain from Google Drive..."
@@ -241,7 +276,7 @@ jobs:
 
             RENPY_VER="8.5.0"
             wget -q "https://www.renpy.org/dl/${RENPY_VER}/renpy-${RENPY7_VER}-sdk.tar.bz2" 2>/dev/null || true
-            wget -q "https://www.renpy.org/dl/${RENPY_VER}/renpy-${RENPY7_VER}-sdk.tar.bz2"
+            wget -q "https://www.renpy.org/dl/${RENPY_VER}/renpy-${RENPY_VER}-sdk.tar.bz2"
             tar -xjf "renpy-${RENPY7_VER}-sdk.tar.bz2" 2>/dev/null || true
             tar -xjf "renpy-${RENPY7_VER}-sdk.tar.bz2"
             mv "renpy-${RENPY7_VER}-sdk" toolchain/renpy_sdk
@@ -265,8 +300,8 @@ jobs:
           ln -sfn "$PWD/toolchain/renpy_sdk" renpy_sdk
           ln -sfn "$PWD/toolchain/renpy7_sdk" renpy7_sdk
 
-      - name: Build & Smart-Schedule Games Across Pods (10MB Chunks, No Auto-Evict)
-        if: ${{ github.event.inputs.target_archive != 'LIST' && github.event.inputs.target_archive != 'list' && github.event.inputs.target_archive != 'STATUS' && github.event.inputs.target_archive != 'status' && !startsWith(github.event.inputs.target_archive, 'DELETE:') && !startsWith(github.event.inputs.target_archive, 'delete:') }}
+      - name: Build Selected Games on Chosen Target (sync / sync_1..5)
+        if: ${{ github.event.inputs.target_archive != 'LIST' && github.event.inputs.target_archive != 'list' && !startsWith(github.event.inputs.target_archive, 'STATUS') && !startsWith(github.event.inputs.target_archive, 'status') && !startsWith(github.event.inputs.target_archive, 'DELETE:') && !startsWith(github.event.inputs.target_archive, 'delete:') }}
         env:
           GH_TOKEN: ${{ secrets.GH_PAT || secrets.GITHUB_TOKEN }}
           REPO_NAME: ${{ github.repository }}
@@ -289,138 +324,69 @@ jobs:
             fi
           }
 
-          cat << 'PODHELPER' > pod_helper.py
-          import os, json, shutil, subprocess, sys, time
+          PARSED=$(python3 - << 'PARSEPY'
+          import os, re, json
 
-          def get_pods():
-              raw = os.environ.get("POD_TARGETS_JSON", "").strip()
-              if raw:
-                  return json.loads(raw)
-              repo = os.environ["REPO_NAME"]
-              return [{"name": "pod-0", "repo": repo, "pages_base": f"https://hola41242.github.io/{repo.split('/')[-1]}", "max_mb": 850}]
+          raw = os.environ.get("TARGET", "").strip()
+          default_pods = [
+              {"name": "sync", "repo": os.environ["REPO_NAME"], "pages_base": f"https://hola41242.github.io/{os.environ['REPO_NAME'].split('/')[-1]}", "max_mb": 850},
+              {"name": "sync_1", "repo": "hola41242/data_sync_1", "pages_base": "https://hola41242.github.io/data_sync_1", "max_mb": 850},
+              {"name": "sync_2", "repo": "hola41242/data_sync_2", "pages_base": "https://hola41242.github.io/data_sync_2", "max_mb": 850},
+              {"name": "sync_3", "repo": "hola41242/data_sync_3", "pages_base": "https://hola41242.github.io/data_sync_3", "max_mb": 850},
+              {"name": "sync_4", "repo": "hola41242/data_sync_4", "pages_base": "https://hola41242.github.io/data_sync_4", "max_mb": 850},
+              {"name": "sync_5", "repo": "hola41242/data_sync_5", "pages_base": "https://hola41242.github.io/data_sync_5", "max_mb": 850},
+          ]
+          raw_pods = os.environ.get("POD_TARGETS_JSON", "").strip()
+          pods = json.loads(raw_pods) if raw_pods else default_pods
 
-          def dir_size(path):
-              total = 0
-              for r, _, files in os.walk(path):
-                  for f in files:
-                      total += os.path.getsize(os.path.join(r, f))
-              return total
+          alias_map = {
+              "sync": 0, "pod-0": 0, "data_sync": 0,
+              "sync_1": 1, "pod-1": 1, "data_sync_1": 1,
+              "sync_2": 2, "pod-2": 2, "data_sync_2": 2,
+              "sync_3": 3, "pod-3": 3, "data_sync_3": 3,
+              "sync_4": 4, "pod-4": 4, "data_sync_4": 4,
+              "sync_5": 5, "pod-5": 5, "data_sync_5": 5,
+          }
 
-          def run_git(args, cwd):
-              return subprocess.run(["git"] + args, cwd=cwd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+          target_idx = 0
+          rest = raw
+          m = re.match(r'^(sync(?:_[1-5])?|pod-[0-5]|data_sync(?:_[1-5])?)\s*[:\s]+(.+)$', raw, re.I)
+          if m:
+              target_idx = alias_map.get(m.group(1).lower(), 0)
+              rest = m.group(2).strip()
 
-          def sync_pod(idx, pod):
-              token = os.environ["GH_TOKEN"]
-              prepo = pod["repo"]
-              pdir = f"pod_ws_{idx}"
-              if not os.path.exists(os.path.join(pdir, ".git")):
-                  shutil.rmtree(pdir, ignore_errors=True)
-                  os.makedirs(pdir, exist_ok=True)
-                  remote_url = f"https://x-access-token:{token}@github.com/{prepo}.git"
-                  run_git(["init"], pdir)
-                  run_git(["remote", "add", "origin", remote_url], pdir)
-                  has_remote = run_git(["ls-remote", "--exit-code", "--heads", "origin", "gh-pages"], pdir).returncode == 0
-                  if has_remote:
-                      fetch_res = run_git(["fetch", "origin", "gh-pages"], pdir)
-                      if fetch_res.returncode == 0:
-                          run_git(["checkout", "-b", "gh-pages", "origin/gh-pages"], pdir)
-                      else:
-                          run_git(["checkout", "-b", "gh-pages"], pdir)
-                  else:
-                      run_git(["checkout", "-b", "gh-pages"], pdir)
-                  run_git(["config", "user.name", "github-actions[bot]"], pdir)
-                  run_git(["config", "user.email", "github-actions[bot]@users.noreply.github.com"], pdir)
-              return pdir
+          if target_idx >= len(pods):
+              target_idx = 0
+          pod = pods[target_idx]
+          tlabel = "sync" if target_idx == 0 else f"sync_{target_idx}"
+          print(f"{target_idx}|{pod['repo']}|{tlabel}|{pod['pages_base'].rstrip('/')}|{rest}")
+          PARSEPY
+          )
 
-          def get_pod_games_and_used(pdir):
-              games = []
-              for d in os.listdir(pdir):
-                  full = os.path.join(pdir, d)
-                  if os.path.isdir(full) and not d.startswith('.') and os.path.exists(os.path.join(full, "index.html")):
-                      games.append(d)
-              used = sum(dir_size(os.path.join(pdir, g)) for g in games)
-              return games, used
+          TARGET_IDX=$(echo "$PARSED" | cut -d'|' -f1)
+          TARGET_REPO=$(echo "$PARSED" | cut -d'|' -f2)
+          TARGET_LABEL=$(echo "$PARSED" | cut -d'|' -f3)
+          TARGET_BASE=$(echo "$PARSED" | cut -d'|' -f4)
+          REST_FILES=$(echo "$PARSED" | cut -d'|' -f5-)
 
-          def find_existing_slug(pods, slug):
-              for idx, pod in enumerate(pods):
-                  pdir = sync_pod(idx, pod)
-                  if os.path.isdir(os.path.join(pdir, slug)) and os.path.exists(os.path.join(pdir, slug, "index.html")):
-                      return idx, pod, pdir
-              return None
+          mkdir -p site_root
+          cd site_root
+          git init
+          git remote add origin "https://x-access-token:${GH_TOKEN}@github.com/${TARGET_REPO}.git"
+          if git ls-remote --exit-code --heads origin gh-pages >/dev/null 2>&1; then
+            git fetch origin gh-pages
+            git checkout -b gh-pages origin/gh-pages
+          else
+            git checkout -b gh-pages
+          fi
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          cd ..
 
-          def select_pod_for_game(pods, slug, incoming_bytes):
-              existing = find_existing_slug(pods, slug)
-              if existing:
-                  return existing
-              for idx, pod in enumerate(pods):
-                  pdir = sync_pod(idx, pod)
-                  max_bytes = int(float(pod.get("max_mb", 850)) * 1024 * 1024)
-                  games, used = get_pod_games_and_used(pdir)
-                  if used + incoming_bytes <= max_bytes:
-                      return idx, pod, pdir
-              for idx, pod in enumerate(pods):
-                  pdir = sync_pod(idx, pod)
-                  games, _ = get_pod_games_and_used(pdir)
-                  if len(games) == 0:
-                      return idx, pod, pdir
-              return None
-
-          def write_index(pdir):
-              games = sorted([d for d in os.listdir(pdir) if os.path.isdir(os.path.join(pdir, d)) and not d.startswith('.') and os.path.exists(os.path.join(pdir, d, "index.html"))])
-              cards = "\n".join([f'<a href="./{g}/" style="display:block;padding:18px;margin:10px;background:#1e1e2e;color:#fff;text-decoration:none;border-radius:10px;font:600 18px sans-serif;border:1px solid #313244;">▶ {g.upper()} <span style="float:right;color:#a6e3a1;font-size:13px;">/{g}/</span></a>' for g in games])
-              with open(os.path.join(pdir, "index.html"), "w", encoding="utf-8") as f:
-                  f.write(f'<!DOCTYPE html><html><head><meta charset="utf-8"><title>Game Stream Library</title></head><body style="background:#11111b;color:#cdd6f4;font-family:sans-serif;max-width:700px;margin:40px auto;padding:20px;"><h1>🎮 Cloud Ren\'Py Library</h1>{cards}</body></html>')
-
-          cmd = sys.argv[1]
-          pods = get_pods()
-          if cmd == "check_skip":
-              slug = sys.argv[2]
-              found = find_existing_slug(pods, slug)
-              if found:
-                  _, pod, _ = found
-                  rel_ok = subprocess.run(["gh", "release", "view", f"game-{slug}", "--repo", pod["repo"]], env={**os.environ, "GH_TOKEN": os.environ["GH_TOKEN"]}, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL).returncode == 0
-                  if rel_ok:
-                      print("SKIP")
-                      sys.exit(0)
-              print("BUILD")
-          elif cmd == "assign":
-              slug = sys.argv[2]
-              inc_bytes = int(sys.argv[3])
-              res = select_pod_for_game(pods, slug, inc_bytes)
-              if not res:
-                  print("FULL")
-                  sys.exit(0)
-              idx, pod, _ = res
-              print(f"{idx}|{pod['repo']}|{pod.get('name', f'pod-{idx}')}")
-          elif cmd == "deploy":
-              slug = sys.argv[2]
-              idx = int(sys.argv[3])
-              pod = pods[idx]
-              pdir = sync_pod(idx, pod)
-              target_dir = os.path.join(pdir, slug)
-              shutil.rmtree(target_dir, ignore_errors=True)
-              shutil.move("web_out", target_dir)
-              with open(os.path.join(target_dir, ".built_ts"), "w") as tf:
-                  tf.write(str(int(time.time())))
-              write_index(pdir)
-              subprocess.run(["git", "add", "-A"], cwd=pdir, check=True)
-              subprocess.run(["git", "commit", "-m", f"Deploy {slug} on {pod.get('name', 'pod')}"], cwd=pdir, check=False)
-              push_res = subprocess.run(["git", "push", "origin", "gh-pages"], cwd=pdir, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
-              if push_res.returncode != 0:
-                  print("GIT PUSH ERROR:", push_res.stderr, file=sys.stderr)
-                  has_remote_branch = run_git(["ls-remote", "--exit-code", "--heads", "origin", "gh-pages"], pdir).returncode == 0
-                  if has_remote_branch:
-                      run_git(["fetch", "origin", "gh-pages"], pdir)
-                      run_git(["reset", "--hard", "origin/gh-pages"], pdir)
-                  subprocess.run(["gh", "release", "delete", f"game-{slug}", "--repo", pod["repo"], "--yes", "--cleanup-tag"], env={**os.environ, "GH_TOKEN": os.environ["GH_TOKEN"]}, check=False)
-                  sys.exit(1)
-              print(f"DEPLOYED:{pod.get('name', 'pod')}:{pod['pages_base'].rstrip('/')}/{slug}/")
-          PODHELPER
-
-          if [ "$TARGET" = "ALL" ]; then
+          if [ "$REST_FILES" = "ALL" ]; then
             FILES=$(rclone lsf gdrive:Games --files-only | grep -iE '\.(zip|rar|7z)$')
           else
-            FILES=$(echo "$TARGET" | tr ',' '\n' | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')
+            FILES=$(echo "$REST_FILES" | tr ',' '\n' | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')
           fi
 
           echo "$FILES" | while IFS= read -r ARCHIVE; do
@@ -429,23 +395,18 @@ jobs:
             [ -z "$SLUG" ] && SLUG="game$(date +%s)"
             TAG="game-${SLUG}"
 
-            if [ "$TARGET" = "ALL" ] && [ "$(python3 pod_helper.py check_skip "$SLUG")" = "SKIP" ]; then
-              echo "Skipping already live game: $SLUG ($ARCHIVE)"
-              continue
-            fi
-
-            echo "=== Building $ARCHIVE -> /$SLUG/ ==="
+            echo "=== Building $ARCHIVE -> /$SLUG/ on $TARGET_LABEL ($TARGET_REPO) ==="
             rm -rf raw_extract game_src web_out chunks_out script_order.json web_build.log
             mkdir -p raw_extract game_src web_out chunks_out
 
             if ! rclone copyto "gdrive:Games/${ARCHIVE}" "./${ARCHIVE}" --multi-thread-streams 8 --drive-chunk-size 128M; then
-              notify_tg "⚠️ Failed & Skipped: $ARCHIVE (Google Drive download error)"
+              notify_tg "⚠️ Failed & Skipped: $ARCHIVE on $TARGET_LABEL (Google Drive download error)"
               rm -f "${ARCHIVE}"
               continue
             fi
 
             if ! 7z x "${ARCHIVE}" -oraw_extract -y >/dev/null; then
-              notify_tg "⚠️ Failed & Skipped: $ARCHIVE (Archive extraction error)"
+              notify_tg "⚠️ Failed & Skipped: $ARCHIVE on $TARGET_LABEL (Archive extraction error)"
               rm -rf "${ARCHIVE}" raw_extract
               continue
             fi
@@ -453,7 +414,7 @@ jobs:
 
             GAME_SUBDIR=$(find raw_extract -type d -name "game" | awk '{ print length, $0 }' | sort -n | head -n 1 | cut -d" " -f2-)
             if [ -z "$GAME_SUBDIR" ]; then
-              notify_tg "⚠️ Failed & Skipped: $ARCHIVE (No 'game' folder found)"
+              notify_tg "⚠️ Failed & Skipped: $ARCHIVE on $TARGET_LABEL (No 'game' folder found)"
               rm -rf raw_extract
               continue
             fi
@@ -635,7 +596,7 @@ jobs:
               ERR_TAIL=$(grep -v "Creating package" web_build.log | tail -n 5)
               echo "=== WEB_BUILD FAILED LOG ==="
               grep -v "Creating package" web_build.log | tail -n 40
-              notify_tg "⚠️ Failed & Skipped: $ARCHIVE (Ren'Py web_build error): $ERR_TAIL"
+              notify_tg "⚠️ Failed & Skipped: $ARCHIVE on $TARGET_LABEL (Ren'Py web_build error): $ERR_TAIL"
               rm -rf game_src web_out script_order.json trace_story.py web_build.log
               continue
             fi
@@ -680,13 +641,11 @@ jobs:
               os.replace(tmp_zip, gzip_path)
           SPLITZIP
 
+            SPLIT_GAME_ZIP="0"
             if [ -f "web_out/game.zip" ]; then
               GZIP_SIZE=$(stat -c%s "web_out/game.zip")
-              if [ "$GZIP_SIZE" -gt 157286400 ]; then
-                GZIP_MB=$((GZIP_SIZE / 1048576))
-                notify_tg "⚠️ Failed & Skipped: $ARCHIVE (game.zip is ${GZIP_MB}MB > 150MB limit)"
-                rm -rf web_out chunks_out script_order.json
-                continue
+              if [ "$GZIP_SIZE" -gt 94371840 ]; then
+                SPLIT_GAME_ZIP="1"
               fi
             fi
 
@@ -695,7 +654,7 @@ jobs:
 
           prog_dir = "web_out/game"
           chunks_dir = "chunks_out"
-          MAX_CHUNK_BYTES = 10 * 1024 * 1024
+          MAX_CHUNK_BYTES = 12 * 1024 * 1024
 
           rank_map = {}
           if os.path.exists("script_order.json"):
@@ -753,44 +712,48 @@ jobs:
           if os.path.exists(prog_dir):
               shutil.rmtree(prog_dir)
 
+          game_zip_parts = []
+          gzip_path = "web_out/game.zip"
+          if os.environ.get("SPLIT_GAME_ZIP") == "1" and os.path.exists(gzip_path):
+              part_size = 50 * 1024 * 1024
+              p_idx = 0
+              with open(gzip_path, "rb") as gf:
+                  while True:
+                      buf = gf.read(part_size)
+                      if not buf:
+                          break
+                      pname = f"gamezip_part_{p_idx:03d}.bin"
+                      with open(os.path.join(chunks_dir, pname), "wb") as pf:
+                          pf.write(buf)
+                      game_zip_parts.append(pname)
+                      p_idx += 1
+              os.remove(gzip_path)
+
           with open("web_out/stream_manifest.json", "w", encoding="utf-8") as f:
-              json.dump(manifest, f)
+              json.dump({"manifest": manifest, "game_zip_parts": game_zip_parts}, f)
           PYSCRIPT
 
-            python3 pack_chunks.py
+            SPLIT_GAME_ZIP="$SPLIT_GAME_ZIP" python3 pack_chunks.py
             rm -f script_order.json
 
-            INC_BYTES=$(python3 -c 'import os; print(sum(os.path.getsize(os.path.join(r, f)) for d in ["web_out", "chunks_out"] if os.path.exists(d) for r, _, fs in os.walk(d) for f in fs))')
-            ASSIGNED=$(python3 pod_helper.py assign "$SLUG" "$INC_BYTES")
-            if [ "$ASSIGNED" = "FULL" ]; then
-              notify_tg "⚠️ Failed & Skipped: $ARCHIVE (All configured pods are full; run DELETE: slug to free space)"
-              rm -rf web_out chunks_out pack_chunks.py
-              continue
-            fi
-
-            POD_IDX=$(echo "$ASSIGNED" | cut -d'|' -f1)
-            POD_REPO=$(echo "$ASSIGNED" | cut -d'|' -f2)
-            POD_NAME=$(echo "$ASSIGNED" | cut -d'|' -f3)
-            echo "Assigned $SLUG -> $POD_NAME ($POD_REPO)"
-
-            GH_TOKEN="$GH_TOKEN" gh release delete "$TAG" --repo "$POD_REPO" --yes --cleanup-tag 2>&1 || true
+            GH_TOKEN="$GH_TOKEN" gh release delete "$TAG" --repo "$TARGET_REPO" --yes --cleanup-tag 2>&1 || true
             sleep 2
-            if ! GH_TOKEN="$GH_TOKEN" gh release view "$TAG" --repo "$POD_REPO" >/dev/null 2>&1; then
-              if ! GH_TOKEN="$GH_TOKEN" gh release create "$TAG" --repo "$POD_REPO" --title "Progressive Stream: $SLUG" --notes "Script-ordered 10MB zero-blur chunks" 2>&1; then
+            if ! GH_TOKEN="$GH_TOKEN" gh release view "$TAG" --repo "$TARGET_REPO" >/dev/null 2>&1; then
+              if ! GH_TOKEN="$GH_TOKEN" gh release create "$TAG" --repo "$TARGET_REPO" --title "Progressive Stream: $SLUG" --notes "Script-ordered 12MB zero-blur chunks" 2>&1; then
                 sleep 2
-                GH_TOKEN="$GH_TOKEN" gh release create "$TAG" --repo "$POD_REPO" --title "Progressive Stream: $SLUG" --notes "Script-ordered 10MB zero-blur chunks" 2>&1 || true
+                GH_TOKEN="$GH_TOKEN" gh release create "$TAG" --repo "$TARGET_REPO" --title "Progressive Stream: $SLUG" --notes "Script-ordered 12MB zero-blur chunks" 2>&1 || true
               fi
             fi
 
-            if ! GH_TOKEN="$GH_TOKEN" gh release view "$TAG" --repo "$POD_REPO" >/dev/null 2>&1; then
-              notify_tg "⚠️ Failed & Skipped: $ARCHIVE (GitHub Release create error on $POD_NAME)"
+            if ! GH_TOKEN="$GH_TOKEN" gh release view "$TAG" --repo "$TARGET_REPO" >/dev/null 2>&1; then
+              notify_tg "⚠️ Failed & Skipped: $ARCHIVE on $TARGET_LABEL (GitHub Release create error)"
               rm -rf web_out chunks_out pack_chunks.py
               continue
             fi
 
-            if ls chunks_out/chunk_*.zip 1> /dev/null 2>&1; then
-              if ! GH_TOKEN="$GH_TOKEN" gh release upload "$TAG" chunks_out/chunk_*.zip --repo "$POD_REPO" --clobber 2>&1; then
-                notify_tg "⚠️ Failed & Skipped: $ARCHIVE (GitHub Release upload error on $POD_NAME)"
+            if ls chunks_out/*.zip chunks_out/*.bin 1> /dev/null 2>&1; then
+              if ! GH_TOKEN="$GH_TOKEN" gh release upload "$TAG" chunks_out/* --repo "$TARGET_REPO" --clobber 2>&1; then
+                notify_tg "⚠️ Failed & Skipped: $ARCHIVE on $TARGET_LABEL (GitHub Release upload error)"
                 rm -rf web_out chunks_out pack_chunks.py
                 continue
               fi
@@ -800,13 +763,20 @@ jobs:
           import os, json
 
           slug = os.environ["CUR_SLUG"]
-          repo = os.environ["CUR_POD_REPO"]
+          repo = os.environ["CUR_TARGET_REPO"]
           tag = "game-" + slug
           worker = "https://gh-cors-proxy.shubhamyadav39275000.workers.dev"
           base_url = worker + "/?url=https://github.com/" + repo + "/releases/download/" + tag
 
           with open("web_out/stream_manifest.json", "r", encoding="utf-8") as f:
-              manifest = json.load(f)
+              raw_data = json.load(f)
+
+          if isinstance(raw_data, dict) and "manifest" in raw_data:
+              manifest = raw_data["manifest"]
+              game_zip_parts = raw_data.get("game_zip_parts", [])
+          else:
+              manifest = raw_data
+              game_zip_parts = []
 
           chunks = sorted(list(set(manifest.values())))
 
@@ -827,6 +797,7 @@ jobs:
             const BASE_URL = __BASE_URL__;
             const MANIFEST = __MANIFEST__;
             const ALL_CHUNKS = __CHUNKS__;
+            const GAME_ZIP_PARTS = __GAME_ZIP_PARTS__;
             const MAX_BUFFER_BYTES = 384 * 1024 * 1024;
 
             let hud = null;
@@ -864,6 +835,12 @@ jobs:
               const bn = cleanPath.split('/').pop();
               if (bn && BASENAME_MAP.has(bn)) return BASENAME_MAP.get(bn);
               return null;
+            }
+
+            function isGameZipRequest(rawUrl) {
+              if (!rawUrl || typeof rawUrl !== 'string' || GAME_ZIP_PARTS.length === 0) return false;
+              const cleanPath = rawUrl.split('?')[0].split('#')[0].toLowerCase();
+              return cleanPath === 'game.zip' || cleanPath.endsWith('/game.zip');
             }
 
             function writeToEmscriptenFS(relPath, uint8Data) {
@@ -931,7 +908,7 @@ jobs:
               }
             }
 
-            async function loadChunk(chunkName, isUrgent = false, preloadAhead = 8) {
+            async function loadChunk(chunkName, isUrgent = false, preloadAhead = 4) {
               if (fifoCache.has(chunkName)) {
                 const entry = fifoCache.get(chunkName);
                 entry.lastUsed = Date.now();
@@ -976,18 +953,16 @@ jobs:
                   if (preloadAhead > 0) {
                     const idx = ALL_CHUNKS.indexOf(chunkName);
                     if (idx !== -1) {
-                      const nextBatch = [];
-                      for (let offset = 1; offset <= preloadAhead; offset++) {
-                        if (activeUrgentCount > 0) break;
-                        if (idx + offset >= ALL_CHUNKS.length) break;
-                        const nextName = ALL_CHUNKS[idx + offset];
-                        if (!fifoCache.has(nextName) && !inflightChunks.has(nextName) && (currentBufferBytes + 20*1024*1024) <= MAX_BUFFER_BYTES) {
-                          nextBatch.push(loadChunk(nextName, false, 0).catch(() => {}));
+                      (async () => {
+                        for (let offset = 1; offset <= preloadAhead; offset++) {
+                          if (activeUrgentCount > 0) break;
+                          if (idx + offset >= ALL_CHUNKS.length) break;
+                          const nextName = ALL_CHUNKS[idx + offset];
+                          if (!fifoCache.has(nextName) && !inflightChunks.has(nextName) && (currentBufferBytes + 20*1024*1024) <= MAX_BUFFER_BYTES) {
+                            await loadChunk(nextName, false, 0).catch(() => {});
+                          }
                         }
-                      }
-                      if (nextBatch.length > 0) {
-                        Promise.allSettled(nextBatch);
-                      }
+                      })();
                     }
                   }
                 }
@@ -998,7 +973,7 @@ jobs:
             }
 
             async function getAssetRecord(info) {
-              const entry = await loadChunk(info.chunk, true, 8);
+              const entry = await loadChunk(info.chunk, true, 4);
               return entry ? (entry.files.get(info.key) || null) : null;
             }
 
@@ -1009,6 +984,31 @@ jobs:
               const bUrl = URL.createObjectURL(new Blob([rec.bytes], { type: 'video/webm' }));
               blobUrlCache.set(info.key, bUrl);
               return bUrl;
+            }
+
+            let mergedGameZipPromise = null;
+            async function getMergedGameZipBytes() {
+              if (mergedGameZipPromise) return mergedGameZipPromise;
+              mergedGameZipPromise = (async () => {
+                const buffers = [];
+                let totalLen = 0;
+                for (const part of GAME_ZIP_PARTS) {
+                  updateHud(`Loading ${part}...`);
+                  const res = await fetchWithRetry(BASE_URL + "/" + part, 2);
+                  if (!res || !res.ok) return null;
+                  const ab = await res.arrayBuffer();
+                  buffers.push(ab);
+                  totalLen += ab.byteLength;
+                }
+                const merged = new Uint8Array(totalLen);
+                let offset = 0;
+                for (const ab of buffers) {
+                  merged.set(new Uint8Array(ab), offset);
+                  offset += ab.byteLength;
+                }
+                return merged;
+              })();
+              return mergedGameZipPromise;
             }
 
             const mediaProto = HTMLMediaElement.prototype;
@@ -1073,16 +1073,16 @@ jobs:
               return origMediaLoad.apply(this, arguments);
             };
 
-            const initBatch = [];
-            for (let i = 0; i < Math.min(8, ALL_CHUNKS.length); i++) {
-              initBatch.push(loadChunk(ALL_CHUNKS[i], false, 8).catch(() => {}));
-            }
-            if (initBatch.length > 0) {
-              Promise.allSettled(initBatch);
+            for (let i = 0; i < Math.min(4, ALL_CHUNKS.length); i++) {
+              loadChunk(ALL_CHUNKS[i], false, 4).catch(() => {});
             }
 
             window.fetch = async function(resource, init) {
               const rawUrl = (typeof resource === 'string') ? resource : (resource && resource.url) || '';
+              if (isGameZipRequest(rawUrl)) {
+                const merged = await getMergedGameZipBytes();
+                if (merged) return new Response(merged.buffer, { status: 200, headers: { 'Content-Type': 'application/zip' } });
+              }
               const info = resolveAsset(rawUrl);
               if (info) {
                 const rec = await getAssetRecord(info);
@@ -1094,13 +1094,39 @@ jobs:
             const origOpen = XMLHttpRequest.prototype.open;
             const origSend = XMLHttpRequest.prototype.send;
             XMLHttpRequest.prototype.open = function(method, url) {
+              this._isGameZip = isGameZipRequest(url);
               this._streamInfo = resolveAsset(url);
               return origOpen.apply(this, arguments);
             };
             XMLHttpRequest.prototype.send = function(body) {
+              const xhr = this;
+              if (xhr._isGameZip) {
+                getMergedGameZipBytes().then(merged => {
+                  if (!merged) {
+                    Object.defineProperty(xhr, 'status', { value: 404, configurable: true });
+                    Object.defineProperty(xhr, 'readyState', { value: 4, configurable: true });
+                    xhr.dispatchEvent(new Event('readystatechange'));
+                    xhr.dispatchEvent(new Event('error'));
+                    return;
+                  }
+                  const ab = merged.buffer.slice(merged.byteOffset, merged.byteOffset + merged.byteLength);
+                  let respVal = ab;
+                  if (xhr.responseType === 'blob') respVal = new Blob([merged], { type: 'application/zip' });
+                  else if (xhr.responseType === 'text' || xhr.responseType === '') respVal = new TextDecoder().decode(merged);
+                  else if (xhr.responseType === 'json') respVal = JSON.parse(new TextDecoder().decode(merged));
+                  Object.defineProperty(xhr, 'status', { value: 200, configurable: true });
+                  Object.defineProperty(xhr, 'statusText', { value: 'OK', configurable: true });
+                  Object.defineProperty(xhr, 'readyState', { value: 4, configurable: true });
+                  Object.defineProperty(xhr, 'response', { value: respVal, configurable: true });
+                  if (xhr.responseType === '' || xhr.responseType === 'text') Object.defineProperty(xhr, 'responseText', { value: respVal, configurable: true });
+                  xhr.dispatchEvent(new Event('readystatechange'));
+                  xhr.dispatchEvent(new Event('load'));
+                  xhr.dispatchEvent(new Event('loadend'));
+                });
+                return;
+              }
               const info = this._streamInfo;
               if (!info) return origSend.apply(this, arguments);
-              const xhr = this;
               getAssetRecord(info).then(rec => {
                 if (!rec) {
                   Object.defineProperty(xhr, 'status', { value: 404, configurable: true });
@@ -1130,7 +1156,8 @@ jobs:
           hook = (js_template
                   .replace("__BASE_URL__", json.dumps(base_url))
                   .replace("__MANIFEST__", json.dumps(manifest))
-                  .replace("__CHUNKS__", json.dumps(chunks)))
+                  .replace("__CHUNKS__", json.dumps(chunks))
+                  .replace("__GAME_ZIP_PARTS__", json.dumps(game_zip_parts)))
 
           with open("web_out/index.html", "r", encoding="utf-8") as f:
               html = f.read()
@@ -1141,15 +1168,31 @@ jobs:
           os.remove("web_out/stream_manifest.json")
           INJECTPY
 
-            CUR_SLUG="$SLUG" CUR_POD_REPO="$POD_REPO" python3 inject_loader.py
-            DEPLOY_OUT=$(python3 pod_helper.py deploy "$SLUG" "$POD_IDX")
-            if [ $? -ne 0 ]; then
-              notify_tg "⚠️ Failed & Skipped: $ARCHIVE (Git push rejected on $POD_NAME)"
-              rm -rf chunks_out pack_chunks.py inject_loader.py
-              continue
-            fi
+            CUR_SLUG="$SLUG" CUR_TARGET_REPO="$TARGET_REPO" python3 inject_loader.py
+            rm -rf "site_root/$SLUG"
+            mv web_out "site_root/$SLUG"
+            date +%s > "site_root/$SLUG/.built_ts"
             rm -rf chunks_out pack_chunks.py inject_loader.py
-            echo "Result: $DEPLOY_OUT"
+
+            (
+              cd site_root
+              python3 - << 'INDEXPY'
+          import os
+          games = sorted([d for d in os.listdir('.') if os.path.isdir(d) and not d.startswith('.') and os.path.exists(os.path.join(d, 'index.html'))])
+          cards = "\n".join([f'<a href="./{g}/" style="display:block;padding:18px;margin:10px;background:#1e1e2e;color:#fff;text-decoration:none;border-radius:10px;font:600 18px sans-serif;border:1px solid #313244;">▶ {g.upper()} <span style="float:right;color:#a6e3a1;font-size:13px;">/{g}/</span></a>' for g in games])
+          with open("index.html", "w", encoding="utf-8") as f:
+              f.write(f'<!DOCTYPE html><html><head><meta charset="utf-8"><title>Game Stream Library</title></head><body style="background:#11111b;color:#cdd6f4;font-family:sans-serif;max-width:700px;margin:40px auto;padding:20px;"><h1>🎮 Cloud Ren\'Py Library</h1>{cards}</body></html>')
+          INDEXPY
+
+              git add -A
+              git commit -m "Deploy $SLUG on $TARGET_LABEL" || true
+              if ! git push origin gh-pages; then
+                git reset --hard origin/gh-pages || true
+                GH_TOKEN="$GH_TOKEN" gh release delete "$TAG" --repo "$TARGET_REPO" --yes --cleanup-tag || true
+                exit 1
+              fi
+            ) || notify_tg "⚠️ Failed & Skipped: $ARCHIVE on $TARGET_LABEL (Git push rejected)"
+            echo "DEPLOYED:$TARGET_LABEL:${TARGET_BASE}/${SLUG}/"
           done
 
-          notify_tg "✅ Batch Build Finished! Send /status to view ready game links & storage."
+          notify_tg "✅ Build Finished on $TARGET_LABEL! Send /status $TARGET_LABEL to view ready game links & storage."
